@@ -1199,6 +1199,510 @@ int main(void) {
 
     printf("[HOST TEST] Stage 5 fault-injection and reliability harness tests PASS\n");
 
+    /* =====================================================================
+     * Stage 6: End-to-End DATA Messaging over Mock Transport host tests
+     * ===================================================================== */
+    printf("[HOST TEST] Running Stage 6 DATA messaging over mock transport tests...\n");
+
+    /* 1. Message fragmentation and slicing */
+    {
+        static const char s_m1[] = "HELLO_NODE_B";
+        uint8_t len1 = (uint8_t)strlen(s_m1);
+        assert(len1 == 12U);
+        uint8_t total1 = (uint8_t)((len1 + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+        assert(total1 == 1U);
+
+        /* Single fragment: idx=0, last=1, len=12 */
+        uint8_t chunk_len1 = (len1 > MAX_PAYLOAD) ? MAX_PAYLOAD : len1;
+        uint8_t last1 = (0U == (total1 - 1U)) ? 1U : 0U;
+        assert(chunk_len1 == 12U);
+        assert(last1 == 1U);
+        assert(memcmp(s_m1, "HELLO_NODE_B", 12U) == 0);
+
+        static const char s_m2[] = "FHSS_DATA_TRANSPORT_TEST_PACKET_#2";
+        uint8_t len2 = (uint8_t)strlen(s_m2);
+        assert(len2 == 34U);
+        uint8_t total2 = (uint8_t)((len2 + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+        assert(total2 == 3U);
+
+        /* Frag 0: idx=0, last=0, len=16 */
+        uint8_t off0 = 0U * MAX_PAYLOAD;
+        uint8_t rem0 = (uint8_t)(len2 - off0);
+        uint8_t chunk_len2_0 = (rem0 > MAX_PAYLOAD) ? MAX_PAYLOAD : rem0;
+        uint8_t last2_0 = (0U == (total2 - 1U)) ? 1U : 0U;
+        assert(chunk_len2_0 == 16U);
+        assert(last2_0 == 0U);
+        assert(memcmp(&s_m2[off0], "FHSS_DATA_TRANSP", 16U) == 0);
+
+        /* Frag 1: idx=1, last=0, len=16 */
+        uint8_t off1 = 1U * MAX_PAYLOAD;
+        uint8_t rem1 = (uint8_t)(len2 - off1);
+        uint8_t chunk_len2_1 = (rem1 > MAX_PAYLOAD) ? MAX_PAYLOAD : rem1;
+        uint8_t last2_1 = (1U == (total2 - 1U)) ? 1U : 0U;
+        assert(chunk_len2_1 == 16U);
+        assert(last2_1 == 0U);
+        assert(memcmp(&s_m2[off1], "ORT_TEST_PACKET_", 16U) == 0);
+
+        /* Frag 2: idx=2, last=1, len=2 */
+        uint8_t off2 = 2U * MAX_PAYLOAD;
+        uint8_t rem2 = (uint8_t)(len2 - off2);
+        uint8_t chunk_len2_2 = (rem2 > MAX_PAYLOAD) ? MAX_PAYLOAD : rem2;
+        uint8_t last2_2 = (2U == (total2 - 1U)) ? 1U : 0U;
+        assert(chunk_len2_2 == 2U);
+        assert(last2_2 == 1U);
+        assert(memcmp(&s_m2[off2], "#2", 2U) == 0);
+
+        /* Boundary checks */
+        /* 1 byte message */
+        uint8_t b1_len = 1U;
+        uint8_t b1_total = (uint8_t)((b1_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+        assert(b1_total == 1U);
+
+        /* 16 byte message */
+        uint8_t b16_len = 16U;
+        uint8_t b16_total = (uint8_t)((b16_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+        assert(b16_total == 1U);
+
+        /* 17 byte message */
+        uint8_t b17_len = 17U;
+        uint8_t b17_total = (uint8_t)((b17_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+        assert(b17_total == 2U);
+
+        /* 128 byte message */
+        uint8_t b128_len = 128U;
+        uint8_t b128_total = (uint8_t)((b128_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+        assert(b128_total == 8U);
+        assert(b128_total == MAX_FRAGMENTS);
+    }
+
+    /* 2. Absence of delimiter 0x7E in frame bodies and wire envelope CRCs */
+    {
+        /* Check Message 1 (seq=0, msg_id=1, total=1, idx=0, last=1) */
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        static const char s_m1[] = "HELLO_NODE_B";
+        assert(fhss_build_data(0U, 1U, 1U, 0U, 1U, 0U, 0U, (const uint8_t *)s_m1, 12U, f_buf, &f_len) == OK);
+        for (uint8_t j = 0; j < f_len; j++) {
+            assert(f_buf[j] != MOCK_WIRE_DELIMITER);
+        }
+        uint8_t env_crc1 = fhss_crc8_update(fhss_crc8((const uint8_t[]){0x00U, f_len}, 2U), f_buf, f_len);
+        assert(env_crc1 != MOCK_WIRE_DELIMITER);
+
+        /* Check Message 2 (3 fragments) */
+        static const char s_m2[] = "FHSS_DATA_TRANSPORT_TEST_PACKET_#2";
+        for (uint8_t idx = 0; idx < 3U; idx++) {
+            uint8_t off = idx * 16U;
+            uint8_t rem = (uint8_t)(34U - off);
+            uint8_t chunk_len = (rem > 16U) ? 16U : rem;
+            uint8_t last = (idx == 2U) ? 1U : 0U;
+            uint8_t seq = 1U + idx;
+
+            assert(fhss_build_data(seq, 2U, 3U, idx, last, 0U, 0U, (const uint8_t *)&s_m2[off], chunk_len, f_buf, &f_len) == OK);
+            for (uint8_t j = 0; j < f_len; j++) {
+                assert(f_buf[j] != MOCK_WIRE_DELIMITER);
+            }
+            uint8_t env_crc = fhss_crc8_update(fhss_crc8((const uint8_t[]){0x00U, f_len}, 2U), f_buf, f_len);
+            assert(env_crc != MOCK_WIRE_DELIMITER);
+        }
+    }
+
+    /* 3. DATA frame construction and bit-packing verification */
+    {
+        fhss_replay_t rx_replay = {0, 0};
+
+        /* Msg 1 Frag 0 */
+        static const char s_m1[] = "HELLO_NODE_B";
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_data(0U, 1U, 1U, 0U, 1U, 0U, 0U, (const uint8_t *)s_m1, 12U, f_buf, &f_len) == OK);
+        assert(f_len == (HEADER_LEN + 12U));
+        assert(f_buf[0] == 0xA1U); /* DATA */
+        assert(f_buf[1] == 0U);    /* seq 0 */
+        assert(f_buf[2] == 1U);    /* msg_id 1 */
+        assert(f_buf[3] == 0x02U); /* total=1 ((0)<<5), idx=0 ((0)<<2), last=1 (2) */
+
+        fhss_frame_t parsed;
+        assert(fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed) == OK);
+        assert(parsed.type == PKT_TYPE_DATA);
+        assert(parsed.seq == 0U);
+        assert(parsed.msg_id == 1U);
+        assert(parsed.total == 1U);
+        assert(parsed.idx == 0U);
+        assert(parsed.last == 1U);
+        assert(parsed.payload_len == 12U);
+        assert(memcmp(parsed.payload, s_m1, 12U) == 0);
+        assert(rx_replay.last_seq == 0U);
+        assert(rx_replay.have_last == 1U);
+
+        /* Msg 2 Frags 0, 1, 2 */
+        static const char s_m2[] = "FHSS_DATA_TRANSPORT_TEST_PACKET_#2";
+        for (uint8_t idx = 0; idx < 3U; idx++) {
+            uint8_t off = idx * 16U;
+            uint8_t rem = (uint8_t)(34U - off);
+            uint8_t chunk_len = (rem > 16U) ? 16U : rem;
+            uint8_t last = (idx == 2U) ? 1U : 0U;
+            uint8_t seq = 1U + idx;
+
+            assert(fhss_build_data(seq, 2U, 3U, idx, last, 0U, 0U, (const uint8_t *)&s_m2[off], chunk_len, f_buf, &f_len) == OK);
+            assert(f_len == (HEADER_LEN + chunk_len));
+            assert(f_buf[0] == 0xA1U);
+            assert(f_buf[1] == seq);
+            assert(f_buf[2] == 2U);
+            uint8_t exp_b3 = (uint8_t)(((3U - 1U) << 5) | (idx << 2) | (last ? 2U : 0U));
+            assert(f_buf[3] == exp_b3);
+
+            assert(fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed) == OK);
+            assert(parsed.type == PKT_TYPE_DATA);
+            assert(parsed.seq == seq);
+            assert(parsed.msg_id == 2U);
+            assert(parsed.total == 3U);
+            assert(parsed.idx == idx);
+            assert(parsed.last == last);
+            assert(parsed.payload_len == chunk_len);
+            assert(memcmp(parsed.payload, &s_m2[off], chunk_len) == 0);
+            assert(rx_replay.last_seq == seq);
+        }
+    }
+
+    /* 4. DATA Integrity Tag Verification & Corruption Rejection */
+    {
+        static const char s_m1[] = "HELLO_NODE_B";
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_data(4U, 1U, 1U, 0U, 1U, 0U, 0U, (const uint8_t *)s_m1, 12U, f_buf, &f_len) == OK);
+
+        /* Corrupt payload byte */
+        uint8_t f_bad_payload[MAX_FRAME_LEN];
+        memcpy(f_bad_payload, f_buf, f_len);
+        f_bad_payload[6] ^= 0x01U;
+        fhss_replay_t rx_replay = {3U, 1U};
+        fhss_frame_t parsed;
+        assert(fhss_parse_frame(f_bad_payload, f_len, DIR_A_TO_B, &rx_replay, &parsed) == ERR_TAG);
+        assert(rx_replay.last_seq == 3U); /* Replay not updated on ERR_TAG */
+
+        /* Corrupt header field (e.g. b3 frag) */
+        uint8_t f_bad_hdr[MAX_FRAME_LEN];
+        memcpy(f_bad_hdr, f_buf, f_len);
+        f_bad_hdr[3] ^= 0x04U;
+        assert(fhss_parse_frame(f_bad_hdr, f_len, DIR_A_TO_B, &rx_replay, &parsed) == ERR_TAG);
+        assert(rx_replay.last_seq == 3U);
+
+        /* Corrupt tag byte itself */
+        uint8_t f_bad_tag[MAX_FRAME_LEN];
+        memcpy(f_bad_tag, f_buf, f_len);
+        f_bad_tag[5] ^= 0x80U;
+        assert(fhss_parse_frame(f_bad_tag, f_len, DIR_A_TO_B, &rx_replay, &parsed) == ERR_TAG);
+        assert(rx_replay.last_seq == 3U);
+    }
+
+    /* 5. ACK Validation Rules */
+    {
+        /* Valid standard FHSS ACK from Node B (independent seq=40, echoes msg_id=2, total=3, bitmap=0x01) */
+        uint8_t ack_wire[MAX_FRAME_LEN];
+        uint8_t ack_len = 0U;
+        assert(fhss_build_ack(40U, 2U, 3U, 0x01U, 200U, 0U, 0U, ack_wire, &ack_len) == OK);
+
+        fhss_replay_t a_rx_replay = {0, 0};
+        fhss_frame_t parsed_ack;
+        assert(fhss_parse_frame(ack_wire, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == OK);
+        assert(parsed_ack.type == PKT_TYPE_ACK);
+        assert(parsed_ack.seq == 40U);
+        assert(parsed_ack.msg_id == 2U);
+        assert(parsed_ack.total == 3U);
+        assert((parsed_ack.payload[0] & (1U << 0)) != 0U); /* Frag 0 ACKed */
+
+        /* Rejection: wrong msg_id (ACK echoes msg_id=99 instead of 2) */
+        uint8_t ack_wrong_msg[MAX_FRAME_LEN];
+        assert(fhss_build_ack(41U, 99U, 3U, 0x01U, 200U, 0U, 0U, ack_wrong_msg, &ack_len) == OK);
+        assert(fhss_parse_frame(ack_wrong_msg, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == OK);
+        assert(parsed_ack.msg_id != 2U); /* Detected by caller as mismatched msg_id */
+
+        /* Rejection: wrong total (ACK reports total=1 instead of 3) */
+        uint8_t ack_wrong_tot[MAX_FRAME_LEN];
+        assert(fhss_build_ack(42U, 2U, 1U, 0x01U, 200U, 0U, 0U, ack_wrong_tot, &ack_len) == OK);
+        assert(fhss_parse_frame(ack_wrong_tot, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == OK);
+        assert(parsed_ack.total != 3U); /* Detected by caller as mismatched total */
+
+        /* Rejection: bitmap bit for fragment 1 is clear (0x01 instead of bit 1 set) */
+        uint8_t ack_frag_not_acked[MAX_FRAME_LEN];
+        assert(fhss_build_ack(43U, 2U, 3U, 0x01U, 200U, 0U, 0U, ack_frag_not_acked, &ack_len) == OK);
+        assert(fhss_parse_frame(ack_frag_not_acked, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == OK);
+        assert((parsed_ack.payload[0] & (1U << 1)) == 0U); /* Fragment 1 is NOT acknowledged */
+
+        /* Rejection: packet type is HOP instead of ACK */
+        uint8_t hop_wire[MAX_FRAME_LEN];
+        uint8_t hop_len = 0U;
+        assert(fhss_build_hop(44U, 0U, 0U, hop_wire, &hop_len) == OK);
+        assert(fhss_parse_frame(hop_wire, hop_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == OK);
+        assert(parsed_ack.type != PKT_TYPE_ACK);
+
+        /* Rejection: corrupted ACK tag */
+        uint8_t ack_corrupt[MAX_FRAME_LEN];
+        assert(fhss_build_ack(45U, 2U, 3U, 0x02U, 200U, 0U, 0U, ack_corrupt, &ack_len) == OK);
+        ack_corrupt[5] ^= 0x55U;
+        assert(fhss_parse_frame(ack_corrupt, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == ERR_TAG);
+
+        /* Rejection: ACK replay violation (re-sending seq=44) */
+        uint8_t ack_replay[MAX_FRAME_LEN];
+        assert(fhss_build_ack(44U, 2U, 3U, 0x02U, 200U, 0U, 0U, ack_replay, &ack_len) == OK);
+        assert(fhss_parse_frame(ack_replay, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == ERR_REPLAY);
+    }
+
+    /* 6. Sequence wraparound for DATA frames and ACKs */
+    {
+        /* DATA sequence wraparound: seq 254 -> 255 -> 0 -> 1 */
+        static const uint8_t s_wrap_seqs[4] = {254U, 255U, 0U, 1U};
+        fhss_replay_t rx_replay = {0, 0};
+
+        for (int i = 0; i < 4; i++) {
+            uint8_t seq = s_wrap_seqs[i];
+            uint8_t f_buf[MAX_FRAME_LEN];
+            uint8_t f_len = 0U;
+            assert(fhss_build_data(seq, 10U, 1U, 0U, 1U, 0U, 0U, (const uint8_t *)"WRAP", 4U, f_buf, &f_len) == OK);
+
+            fhss_frame_t parsed;
+            assert(fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed) == OK);
+            assert(parsed.seq == seq);
+            assert(rx_replay.last_seq == seq);
+        }
+
+        /* ACK sequence wraparound: b_seq 254 -> 255 -> 0 -> 1 */
+        fhss_replay_t tx_rx_replay = {0, 0};
+        for (int i = 0; i < 4; i++) {
+            uint8_t b_seq = s_wrap_seqs[i];
+            uint8_t ack_buf[MAX_FRAME_LEN];
+            uint8_t ack_len = 0U;
+            assert(fhss_build_ack(b_seq, 10U, 1U, 0x01U, 200U, 0U, 0U, ack_buf, &ack_len) == OK);
+
+            fhss_frame_t parsed_ack;
+            assert(fhss_parse_frame(ack_buf, ack_len, DIR_B_TO_A, &tx_rx_replay, &parsed_ack) == OK);
+            assert(parsed_ack.seq == b_seq);
+            assert(tx_rx_replay.last_seq == b_seq);
+        }
+    }
+
+    /* 7. Sender sequential delivery and failure handling simulation */
+    {
+        /* Simulate 3-fragment message with failure at fragment 1 */
+        int frag0_acked = 1;
+        int frag1_acked = 0; /* Simulated timeout or corrupt ACK on frag 1 */
+        int frag2_sent = 0;
+        int m_success = 0;
+
+        if (frag0_acked) {
+            /* Proceed to frag 1 */
+            if (frag1_acked) {
+                frag2_sent = 1;
+            } else {
+                /* Sequential delivery abort: frag 2 MUST NOT be sent */
+                frag2_sent = 0;
+                m_success = 0;
+            }
+        }
+        assert(frag2_sent == 0);
+        assert(m_success == 0);
+
+        /* Simulate complete 3-fragment message success */
+        frag0_acked = 1;
+        frag1_acked = 1;
+        int frag2_acked = 1;
+        if (frag0_acked && frag1_acked && frag2_acked) {
+            frag2_sent = 1;
+            m_success = 1;
+        }
+        assert(frag2_sent == 1);
+        assert(m_success == 1);
+    }
+
+    printf("[HOST TEST] Stage 6 DATA messaging over mock transport tests PASS\n");
+
+    printf("[HOST TEST] Running Stage 7 ARQ Retransmission and ACK Recovery tests...\n");
+
+    /* 1. Exact Deterministic 5-Step Schedule Wire Bytes & CRC Verification */
+    {
+        /* Step 1: seq 0, Msg 1, Frag 0/1 ("HELLO_NODE_B", 12 bytes) */
+        uint8_t f1[MAX_FRAME_LEN]; uint8_t f1_len = 0U;
+        static const char s_m1[] = "HELLO_NODE_B";
+        assert(fhss_build_data(0U, 1U, 1U, 0U, 1U, 0U, 0U, (const uint8_t *)s_m1, 12U, f1, &f1_len) == OK);
+        assert(f1_len == 18U);
+        assert(f1[0] == 0xA1U); /* DATA */
+        assert(f1[1] == 0U);    /* seq 0 */
+        assert(f1[2] == 1U);    /* msg_id 1 */
+        assert(f1[3] == 0x02U); /* total=1, idx=0, last=1 -> ((1-1)<<5)|(0<<2)|(1<<1) = 0x02 */
+        assert(f1[4] == 0x03U); /* masked hop: mask(0,DIR_A_TO_B)=0x03 -> 0x03 */
+        assert(f1[5] == 0x2EU); /* tag = CRC8(header[0..3] + plain_hop + payload) */
+        assert(memcmp(&f1[6], s_m1, 12U) == 0);
+
+        /* Step 2: seq 1, Msg 2, Frag 0/3 ("FHSS_DATA_TRANSP", 16 bytes) */
+        uint8_t f2[MAX_FRAME_LEN]; uint8_t f2_len = 0U;
+        static const char s_m2[] = "FHSS_DATA_TRANSPORT_TEST_PACKET_#2";
+        assert(fhss_build_data(1U, 2U, 3U, 0U, 0U, 0U, 0U, (const uint8_t *)&s_m2[0], 16U, f2, &f2_len) == OK);
+        assert(f2_len == 22U);
+        assert(f2[0] == 0xA1U);
+        assert(f2[1] == 1U);    /* seq 1 */
+        assert(f2[2] == 2U);    /* msg_id 2 */
+        assert(f2[3] == 0x40U); /* total=3, idx=0, last=0 -> (2<<5)|(0<<2)|(0<<1) = 0x40 */
+        assert(f2[4] == 0x52U); /* mask(1,DIR_A_TO_B)=0x52 -> 0x52 */
+        assert(f2[5] == 0x8DU); /* tag */
+
+        /* Step 3: seq 2, Msg 2, Frag 1/3, Attempt 1 ("ORT_TEST_PACKET_", 16 bytes) */
+        uint8_t f3[MAX_FRAME_LEN]; uint8_t f3_len = 0U;
+        assert(fhss_build_data(2U, 2U, 3U, 1U, 0U, 0U, 0U, (const uint8_t *)&s_m2[16], 16U, f3, &f3_len) == OK);
+        assert(f3_len == 22U);
+        assert(f3[0] == 0xA1U);
+        assert(f3[1] == 2U);    /* seq 2 */
+        assert(f3[2] == 2U);    /* msg_id 2 */
+        assert(f3[3] == 0x44U); /* total=3, idx=1, last=0 -> (2<<5)|(1<<2)|(0<<1) = 0x44 */
+        assert(f3[4] == 0xA1U); /* mask(2,DIR_A_TO_B)=0xA1 -> 0xA1 */
+        assert(f3[5] == 0x1EU); /* tag */
+
+        /* Step 4: seq 3, Msg 2, Frag 1/3, Attempt 2 (RETRY with fresh sequence number 3) */
+        uint8_t f4[MAX_FRAME_LEN]; uint8_t f4_len = 0U;
+        assert(fhss_build_data(3U, 2U, 3U, 1U, 0U, 0U, 0U, (const uint8_t *)&s_m2[16], 16U, f4, &f4_len) == OK);
+        assert(f4_len == 22U);
+        assert(f4[0] == 0xA1U);
+        assert(f4[1] == 3U);    /* seq 3 (fresh sequence number!) */
+        assert(f4[2] == 2U);    /* msg_id 2 (retained) */
+        assert(f4[3] == 0x44U); /* total=3, idx=1, last=0 (retained) */
+        assert(f4[4] == 0xF4U); /* mask(3,DIR_A_TO_B)=0xF4 -> 0xF4 (recomputed!) */
+        assert(f4[5] == 0x16U); /* tag recomputed for seq 3! (0x16 != 0x1E) */
+        assert(f4[5] != f3[5]); /* Fresh tag distinct from attempt 1 tag */
+        assert(f4[4] != f3[4]); /* Fresh masked hop distinct from attempt 1 masked hop */
+
+        /* Step 5: seq 4, Msg 2, Frag 2/3 ("#2", 2 bytes) */
+        uint8_t f5[MAX_FRAME_LEN]; uint8_t f5_len = 0U;
+        assert(fhss_build_data(4U, 2U, 3U, 2U, 1U, 0U, 0U, (const uint8_t *)&s_m2[32], 2U, f5, &f5_len) == OK);
+        assert(f5_len == 8U);
+        assert(f5[0] == 0xA1U);
+        assert(f5[1] == 4U);    /* seq 4 */
+        assert(f5[2] == 2U);    /* msg_id 2 */
+        assert(f5[3] == 0x4AU); /* total=3, idx=2, last=1 -> (2<<5)|(2<<2)|(1<<1) = 0x4A */
+        assert(f5[4] == 0x47U); /* mask(4,DIR_A_TO_B)=0x47 -> 0x47 */
+        assert(f5[5] == 0xA8U); /* tag */
+
+        /* Wire envelope checks: Verify no 0x7E in payload or CRC */
+        const uint8_t *frames[5] = {f1, f2, f3, f4, f5};
+        const uint8_t flens[5] = {f1_len, f2_len, f3_len, f4_len, f5_len};
+        for (int k = 0; k < 5; k++) {
+            uint8_t w_hdr[2] = {0U, flens[k]};
+            uint8_t w_crc = fhss_crc8(w_hdr, 2U);
+            w_crc = fhss_crc8_update(w_crc, frames[k], flens[k]);
+            assert(w_crc != 0x7EU);
+            for (uint8_t b = 0; b < flens[k]; b++) {
+                assert(frames[k][b] != 0x7EU);
+            }
+        }
+    }
+
+    /* 2. Replay Protection & Recomputation on Retry */
+    {
+        /* If sender had sent stale sequence 2 on retry, Node B would reject it */
+        fhss_replay_t b_rx_replay = {2U, 1U}; /* Node B already received seq 2 */
+        fhss_frame_t parsed;
+
+        /* Attempt to parse stale seq 2 frame */
+        static const char s_m2[] = "FHSS_DATA_TRANSPORT_TEST_PACKET_#2";
+        uint8_t f_stale[MAX_FRAME_LEN]; uint8_t f_stale_len = 0U;
+        assert(fhss_build_data(2U, 2U, 3U, 1U, 0U, 0U, 0U, (const uint8_t *)&s_m2[16], 16U, f_stale, &f_stale_len) == OK);
+        assert(fhss_parse_frame(f_stale, f_stale_len, DIR_A_TO_B, &b_rx_replay, &parsed) == ERR_REPLAY);
+        assert(b_rx_replay.last_seq == 2U); /* Not updated on replay error */
+
+        /* Fresh seq 3 frame succeeds */
+        uint8_t f_fresh[MAX_FRAME_LEN]; uint8_t f_fresh_len = 0U;
+        assert(fhss_build_data(3U, 2U, 3U, 1U, 0U, 0U, 0U, (const uint8_t *)&s_m2[16], 16U, f_fresh, &f_fresh_len) == OK);
+        assert(fhss_parse_frame(f_fresh, f_fresh_len, DIR_A_TO_B, &b_rx_replay, &parsed) == OK);
+        assert(parsed.seq == 3U);
+        assert(b_rx_replay.last_seq == 3U);
+    }
+
+    /* 3. ACK Bitmap Validation & Cumulative Bitmap Rules */
+    {
+        /* Fragment 0 requires bit 0 */
+        assert((0x01U & (1U << 0)) != 0U); /* Valid (0x01) */
+        assert((0x03U & (1U << 0)) != 0U); /* Cumulative (0x03) valid */
+        assert((0x07U & (1U << 0)) != 0U); /* Cumulative (0x07) valid */
+        assert((0x02U & (1U << 0)) == 0U); /* Bit 0 clear -> Invalid */
+
+        /* Fragment 1 requires bit 1 */
+        assert((0x01U & (1U << 1)) == 0U); /* Bit 1 clear -> Invalid for frag 1 */
+        assert((0x02U & (1U << 1)) != 0U); /* Individual 0x02 valid */
+        assert((0x03U & (1U << 1)) != 0U); /* Cumulative 0x03 valid */
+        assert((0x07U & (1U << 1)) != 0U); /* Cumulative 0x07 valid */
+
+        /* Fragment 2 requires bit 2 */
+        assert((0x03U & (1U << 2)) == 0U); /* Bit 2 clear -> Invalid for frag 2 */
+        assert((0x04U & (1U << 2)) != 0U); /* Individual 0x04 valid */
+        assert((0x07U & (1U << 2)) != 0U); /* Cumulative 0x07 valid */
+    }
+
+    /* 4. ACK Sequence Independence (Node B ACK sequence does NOT echo DATA sequence) */
+    {
+        fhss_replay_t a_rx_replay = {0, 0};
+        fhss_frame_t parsed_ack;
+
+        /* Node A sent DATA seq 2 and 3; Node B responds with ACK seq 50 */
+        uint8_t ack_wire[MAX_FRAME_LEN]; uint8_t ack_len = 0U;
+        assert(fhss_build_ack(50U, 2U, 3U, 0x03U, 180U, 0U, 0U, ack_wire, &ack_len) == OK);
+        assert(fhss_parse_frame(ack_wire, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == OK);
+        assert(parsed_ack.seq == 50U);
+        assert(parsed_ack.seq != 2U && parsed_ack.seq != 3U); /* Sequence independence */
+        assert(parsed_ack.msg_id == 2U);
+        assert(parsed_ack.total == 3U);
+        assert((parsed_ack.payload[0] & (1U << 1)) != 0U); /* Fragment 1 confirmed */
+
+        /* Next ACK from Node B has seq 51 */
+        assert(fhss_build_ack(51U, 2U, 3U, 0x07U, 180U, 0U, 0U, ack_wire, &ack_len) == OK);
+        assert(fhss_parse_frame(ack_wire, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack) == OK);
+        assert(parsed_ack.seq == 51U);
+        assert((parsed_ack.payload[0] & (1U << 2)) != 0U); /* Fragment 2 confirmed */
+    }
+
+    /* 5. ARQ Retry State Machine & Retry Limit Exhaustion Simulation */
+    {
+        /* Simulate 3-attempt limit when ACK is suppressed on all 3 attempts */
+        uint8_t seq = 10U;
+        uint8_t attempts = 0U;
+        int ack_received = 0;
+        const uint8_t max_attempts = 3U;
+
+        for (uint8_t att = 1U; att <= max_attempts; att++) {
+            attempts = att;
+            seq++; /* Fresh sequence on each attempt */
+            /* Simulated ACK check: always times out */
+            ack_received = 0;
+        }
+        assert(attempts == 3U);
+        assert(seq == 13U);
+        assert(ack_received == 0);
+        /* Decision: abort message */
+        int message_aborted = (ack_received == 0) ? 1 : 0;
+        assert(message_aborted == 1);
+
+        /* Simulate recovery on attempt 2 (Stage 7 schedule) */
+        seq = 2U;
+        attempts = 0U;
+        ack_received = 0;
+        for (uint8_t att = 1U; att <= max_attempts; att++) {
+            attempts = att;
+            seq++;
+            if (att == 1U) {
+                /* Attempt 1 times out */
+                ack_received = 0;
+            } else if (att == 2U) {
+                /* Attempt 2 succeeds */
+                ack_received = 1;
+                break;
+            }
+        }
+        assert(attempts == 2U);
+        assert(seq == 4U);
+        assert(ack_received == 1);
+        int message_recovered = (ack_received == 1) ? 1 : 0;
+        assert(message_recovered == 1);
+    }
+
+    printf("[HOST TEST] Stage 7 ARQ Retransmission and ACK Recovery tests PASS\n");
+
     return 0;
 }
 

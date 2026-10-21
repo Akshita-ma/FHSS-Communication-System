@@ -225,13 +225,13 @@ static void selftest_pins_run(void) {
 }
 #endif
 
-#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST)
+#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST) || defined(STEP6_DATA_MOCK) || defined(STEP7_ARQ_MOCK)
 #include "common/air.h"
 #include "common/fhss_protocol.h"
 #include "air_mock.h"
 #endif
 
-#if (defined(DEMO_USART_LINK) || defined(STEP3_FHSS_MOCK)) && !defined(STEP2_MOCK_TEST) && !defined(STEP5_FAULT_TEST)
+#if (defined(DEMO_USART_LINK) || defined(STEP3_FHSS_MOCK)) && !defined(STEP2_MOCK_TEST) && !defined(STEP5_FAULT_TEST) && !defined(STEP6_DATA_MOCK) && !defined(STEP7_ARQ_MOCK)
 
 static void log_sync_locked(uint8_t ch, uint32_t delta) {
     char buf[48];
@@ -1476,6 +1476,1015 @@ static void step5_fault_test_run(void) {
 }
 #endif
 
+#ifdef STEP6_DATA_MOCK
+/*
+ * Stage 6: End-to-End DATA Messaging over USART2 Mock Transport for Node A (STM32F103)
+ *
+ * Exercises application DATA messaging using the frozen FHSS protocol over the wired
+ * USART2 mock transport (SX1278 radios bypassed).
+ * Transmits two deterministic messages:
+ *   1. Short single-fragment message: "HELLO_NODE_B" (12 bytes, msg_id=1, total=1)
+ *   2. Multi-fragment message: "FHSS_DATA_TRANSPORT_TEST_PACKET_#2" (35 bytes, msg_id=2, total=3)
+ *
+ * Validates each fragment's standard FHSS ACK according to frozen protocol rules.
+ * Reports local transmission, ACK validation, peer reconstruction confirmation status,
+ * and payload match verification status separately.
+ */
+
+#define STEP6_ACK_TIMEOUT_MS   150U
+#define STEP6_STARTUP_DELAY_MS 500U
+
+typedef enum {
+    STEP6_ACK_OK = 0,
+    STEP6_ACK_TIMEOUT,
+    STEP6_ACK_BAD_TAG,
+    STEP6_ACK_REPLAY,
+    STEP6_ACK_BAD_TYPE,
+    STEP6_ACK_BAD_MSG_ID,
+    STEP6_ACK_BAD_TOTAL,
+    STEP6_ACK_FRAG_NOT_ACKED,
+    STEP6_ACK_BAD_LEN
+} step6_ack_status_t;
+
+typedef struct {
+    step6_ack_status_t status;
+    uint8_t ack_seq;        /* Node B's independent ACK sequence number */
+    uint8_t ack_msg_id;     /* Echoed msg_id */
+    uint8_t ack_total;      /* Total fragments indicated in ACK */
+    uint8_t ack_bitmap;     /* Fragment received bitmap */
+    uint8_t ack_rssi;       /* Raw RSSI */
+} step6_ack_detail_t;
+
+typedef struct {
+    uint8_t idx;
+    uint8_t seq;
+    uint8_t last;
+    uint8_t chunk_len;
+    uint8_t tx_ok;
+    uint8_t ack_valid;
+    step6_ack_detail_t ack_detail;
+} step6_frag_report_t;
+
+typedef struct {
+    const char *text;
+    uint8_t msg_id;
+    uint8_t msg_len;
+    uint8_t total_frags;
+    uint8_t frags_tx_ok;
+    uint8_t frags_ack_valid;
+    uint8_t all_acked;
+    step6_frag_report_t frags[MAX_FRAGMENTS];
+} step6_msg_report_t;
+
+static void step6_uint8_to_hex(uint8_t val, char *buf) {
+    static const char hex_digits[] = "0123456789ABCDEF";
+    buf[0] = '0';
+    buf[1] = 'x';
+    buf[2] = hex_digits[(val >> 4) & 0x0FU];
+    buf[3] = hex_digits[val & 0x0FU];
+    buf[4] = '\0';
+}
+
+static void step6_append_str(char *buf, uint32_t max_len, uint32_t *pos, const char *s) {
+    if (s == (const char *)0) return;
+    while (*s != '\0' && (*pos + 1U) < max_len) {
+        buf[*pos] = *s++;
+        (*pos)++;
+    }
+    buf[*pos] = '\0';
+}
+
+static void step6_append_u32(char *buf, uint32_t max_len, uint32_t *pos, uint32_t val) {
+    char num[12];
+    uint32_to_ascii(val, num);
+    step6_append_str(buf, max_len, pos, num);
+}
+
+static void step6_append_hex8(char *buf, uint32_t max_len, uint32_t *pos, uint8_t val) {
+    char hex[5];
+    step6_uint8_to_hex(val, hex);
+    step6_append_str(buf, max_len, pos, hex);
+}
+
+static step6_ack_status_t step6_wait_ack(uint8_t tuned_ch, uint8_t exp_msg_id,
+                                         uint8_t exp_total, uint8_t exp_idx,
+                                         uint32_t timeout_ms,
+                                         fhss_replay_t *replay,
+                                         step6_ack_detail_t *detail) {
+    uint32_t t_start = millis();
+    step6_ack_status_t last_status = STEP6_ACK_TIMEOUT;
+    air_mock_clear_diag();
+
+    if (detail != (step6_ack_detail_t *)0) {
+        detail->status = STEP6_ACK_TIMEOUT;
+        detail->ack_seq = 0U;
+        detail->ack_msg_id = 0U;
+        detail->ack_total = 0U;
+        detail->ack_bitmap = 0U;
+        detail->ack_rssi = 0U;
+    }
+
+    while ((millis() - t_start) < timeout_ms) {
+        uint8_t rx_buf[MAX_FRAME_LEN];
+        uint8_t rx_len = 0U;
+        int poll_res = air_rx_poll(tuned_ch, rx_buf, &rx_len);
+
+        if (poll_res == (int)OK) {
+            fhss_frame_t parsed;
+            status_t parse_res = fhss_parse_frame(rx_buf, rx_len, DIR_B_TO_A, replay, &parsed);
+
+            if (parse_res == OK) {
+                if (detail != (step6_ack_detail_t *)0) {
+                    detail->ack_seq = parsed.seq;
+                    detail->ack_msg_id = parsed.msg_id;
+                    detail->ack_total = parsed.total;
+                    detail->ack_bitmap = (parsed.payload_len >= 1U) ? parsed.payload[0] : 0U;
+                    detail->ack_rssi = (parsed.payload_len >= 2U) ? parsed.payload[1] : 0U;
+                }
+
+                if (parsed.type != PKT_TYPE_ACK) {
+                    last_status = STEP6_ACK_BAD_TYPE;
+                } else if (parsed.msg_id != exp_msg_id) {
+                    last_status = STEP6_ACK_BAD_MSG_ID;
+                } else if (parsed.total != exp_total) {
+                    last_status = STEP6_ACK_BAD_TOTAL;
+                } else if ((parsed.payload[0] & (1U << exp_idx)) == 0U) {
+                    last_status = STEP6_ACK_FRAG_NOT_ACKED;
+                } else {
+                    if (detail != (step6_ack_detail_t *)0) {
+                        detail->status = STEP6_ACK_OK;
+                    }
+                    return STEP6_ACK_OK;
+                }
+            } else if (parse_res == ERR_TAG) {
+                last_status = STEP6_ACK_BAD_TAG;
+            } else if (parse_res == ERR_REPLAY) {
+                last_status = STEP6_ACK_REPLAY;
+            } else if (parse_res == ERR_LEN) {
+                last_status = STEP6_ACK_BAD_LEN;
+            } else {
+                last_status = STEP6_ACK_BAD_TYPE;
+            }
+        }
+        __asm__ volatile ("nop");
+    }
+
+    if (detail != (step6_ack_detail_t *)0) {
+        detail->status = last_status;
+    }
+    return last_status;
+}
+
+static void step6_log_ack_fail(uint8_t msg_id, const step6_ack_detail_t *detail) {
+    char buf[80];
+    uint32_t pos = 0;
+    step6_append_str(buf, sizeof(buf), &pos, "ACK msg_id=");
+    step6_append_u32(buf, sizeof(buf), &pos, (uint32_t)msg_id);
+    step6_append_str(buf, sizeof(buf), &pos, " -> FAIL (");
+
+    switch (detail->status) {
+        case STEP6_ACK_TIMEOUT:
+            step6_append_str(buf, sizeof(buf), &pos, "TIMEOUT");
+            break;
+        case STEP6_ACK_BAD_TAG:
+            step6_append_str(buf, sizeof(buf), &pos, "BAD_TAG");
+            break;
+        case STEP6_ACK_REPLAY:
+            step6_append_str(buf, sizeof(buf), &pos, "REPLAY");
+            break;
+        case STEP6_ACK_BAD_TYPE:
+            step6_append_str(buf, sizeof(buf), &pos, "BAD_TYPE");
+            break;
+        case STEP6_ACK_BAD_MSG_ID:
+            step6_append_str(buf, sizeof(buf), &pos, "WRONG_MSG_ID=");
+            step6_append_u32(buf, sizeof(buf), &pos, (uint32_t)detail->ack_msg_id);
+            break;
+        case STEP6_ACK_BAD_TOTAL:
+            step6_append_str(buf, sizeof(buf), &pos, "WRONG_TOTAL=");
+            step6_append_u32(buf, sizeof(buf), &pos, (uint32_t)detail->ack_total);
+            break;
+        case STEP6_ACK_FRAG_NOT_ACKED:
+            step6_append_str(buf, sizeof(buf), &pos, "BITMAP_BIT_CLEAR bm=");
+            step6_append_hex8(buf, sizeof(buf), &pos, detail->ack_bitmap);
+            break;
+        case STEP6_ACK_BAD_LEN:
+            step6_append_str(buf, sizeof(buf), &pos, "BAD_LEN");
+            break;
+        default:
+            step6_append_str(buf, sizeof(buf), &pos, "ERROR");
+            break;
+    }
+    step6_append_str(buf, sizeof(buf), &pos, ")");
+    log_line(TAG_RX, buf);
+}
+
+static int step6_send_message(const char *text, uint8_t msg_id,
+                              uint8_t *inout_seq,
+                              fhss_replay_t *rx_replay,
+                              step6_msg_report_t *report) {
+    if (text == (const char *)0 || inout_seq == (uint8_t *)0 ||
+        rx_replay == (fhss_replay_t *)0 || report == (step6_msg_report_t *)0) {
+        return 0;
+    }
+
+    uint8_t msg_len = 0U;
+    while (text[msg_len] != '\0') {
+        msg_len++;
+    }
+
+    uint8_t total_frags = (uint8_t)((msg_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+    if (total_frags == 0U) {
+        total_frags = 1U;
+    }
+
+    report->text = text;
+    report->msg_id = msg_id;
+    report->msg_len = msg_len;
+    report->total_frags = total_frags;
+    report->frags_tx_ok = 0U;
+    report->frags_ack_valid = 0U;
+    report->all_acked = 0U;
+
+    for (uint8_t idx = 0U; idx < total_frags; idx++) {
+        uint8_t offset = (uint8_t)(idx * MAX_PAYLOAD);
+        uint8_t rem = (uint8_t)(msg_len - offset);
+        uint8_t chunk_len = (rem > MAX_PAYLOAD) ? MAX_PAYLOAD : rem;
+        uint8_t last = (idx == (total_frags - 1U)) ? 1U : 0U;
+        uint8_t seq = *inout_seq;
+
+        step6_frag_report_t *frag_rep = &report->frags[idx];
+        frag_rep->idx = idx;
+        frag_rep->seq = seq;
+        frag_rep->last = last;
+        frag_rep->chunk_len = chunk_len;
+        frag_rep->tx_ok = 0U;
+        frag_rep->ack_valid = 0U;
+
+        uint8_t tx_frame[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        const uint8_t *payload_ptr = (const uint8_t *)&text[offset];
+
+        status_t build_st = fhss_build_data(seq, msg_id, total_frags, idx, last,
+                                            0U, 0U, payload_ptr, chunk_len,
+                                            tx_frame, &tx_len);
+        if (build_st != OK) {
+            log_line(TAG_ERR, "fhss_build_data failed");
+            return 0;
+        }
+
+        /* Flush stale bytes before sending */
+        air_mock_flush();
+
+        int tx_res = air_tx(0U, tx_frame, tx_len);
+
+        /* Format and log TX line */
+        char tx_log[96];
+        uint32_t t_pos = 0;
+        step6_append_str(tx_log, sizeof(tx_log), &t_pos, "DATA msg_id=");
+        step6_append_u32(tx_log, sizeof(tx_log), &t_pos, (uint32_t)msg_id);
+        step6_append_str(tx_log, sizeof(tx_log), &t_pos, " frag=");
+        step6_append_u32(tx_log, sizeof(tx_log), &t_pos, (uint32_t)idx);
+        step6_append_str(tx_log, sizeof(tx_log), &t_pos, "/");
+        step6_append_u32(tx_log, sizeof(tx_log), &t_pos, (uint32_t)total_frags);
+        step6_append_str(tx_log, sizeof(tx_log), &t_pos, " seq=");
+        step6_append_u32(tx_log, sizeof(tx_log), &t_pos, (uint32_t)seq);
+        step6_append_str(tx_log, sizeof(tx_log), &t_pos, " last=");
+        step6_append_u32(tx_log, sizeof(tx_log), &t_pos, (uint32_t)last);
+        step6_append_str(tx_log, sizeof(tx_log), &t_pos, " len=");
+        step6_append_u32(tx_log, sizeof(tx_log), &t_pos, (uint32_t)tx_len);
+        step6_append_str(tx_log, sizeof(tx_log), &t_pos, (tx_res == (int)OK) ? " tx=OK" : " tx=FAIL");
+        log_line(TAG_TX, tx_log);
+
+        if (tx_res != (int)OK) {
+            frag_rep->tx_ok = 0U;
+            char err_buf[64];
+            uint32_t e_pos = 0;
+            step6_append_str(err_buf, sizeof(err_buf), &e_pos, "Msg ");
+            step6_append_u32(err_buf, sizeof(err_buf), &e_pos, (uint32_t)msg_id);
+            step6_append_str(err_buf, sizeof(err_buf), &e_pos, " Frag ");
+            step6_append_u32(err_buf, sizeof(err_buf), &e_pos, (uint32_t)idx);
+            step6_append_str(err_buf, sizeof(err_buf), &e_pos, " air_tx failed");
+            log_line(TAG_TEST, err_buf);
+            return 0; /* Abort sequential delivery */
+        }
+
+        frag_rep->tx_ok = 1U;
+        report->frags_tx_ok++;
+        (*inout_seq)++;
+
+        /* Wait for standard FHSS ACK */
+        step6_ack_status_t ack_res = step6_wait_ack(0U, msg_id, total_frags, idx,
+                                                    STEP6_ACK_TIMEOUT_MS,
+                                                    rx_replay,
+                                                    &frag_rep->ack_detail);
+
+        if (ack_res == STEP6_ACK_OK) {
+            frag_rep->ack_valid = 1U;
+            report->frags_ack_valid++;
+
+            char rx_log[96];
+            uint32_t r_pos = 0;
+            step6_append_str(rx_log, sizeof(rx_log), &r_pos, "ACK msg_id=");
+            step6_append_u32(rx_log, sizeof(rx_log), &r_pos, (uint32_t)msg_id);
+            step6_append_str(rx_log, sizeof(rx_log), &r_pos, " b_seq=");
+            step6_append_u32(rx_log, sizeof(rx_log), &r_pos, (uint32_t)frag_rep->ack_detail.ack_seq);
+            step6_append_str(rx_log, sizeof(rx_log), &r_pos, " bitmap=");
+            step6_append_hex8(rx_log, sizeof(rx_log), &r_pos, frag_rep->ack_detail.ack_bitmap);
+            step6_append_str(rx_log, sizeof(rx_log), &r_pos, " rssi=");
+            step6_append_u32(rx_log, sizeof(rx_log), &r_pos, (uint32_t)frag_rep->ack_detail.ack_rssi);
+            step6_append_str(rx_log, sizeof(rx_log), &r_pos, " -> VALID");
+            log_line(TAG_RX, rx_log);
+
+            char pass_log[64];
+            uint32_t p_pos = 0;
+            step6_append_str(pass_log, sizeof(pass_log), &p_pos, "Msg ");
+            step6_append_u32(pass_log, sizeof(pass_log), &p_pos, (uint32_t)msg_id);
+            step6_append_str(pass_log, sizeof(pass_log), &p_pos, " Frag ");
+            step6_append_u32(pass_log, sizeof(pass_log), &p_pos, (uint32_t)idx);
+            step6_append_str(pass_log, sizeof(pass_log), &p_pos, "/");
+            step6_append_u32(pass_log, sizeof(pass_log), &p_pos, (uint32_t)total_frags);
+            step6_append_str(pass_log, sizeof(pass_log), &p_pos, ": TX=OK ACK=VALID");
+            log_line(TAG_TEST, pass_log);
+        } else {
+            frag_rep->ack_valid = 0U;
+            step6_log_ack_fail(msg_id, &frag_rep->ack_detail);
+
+            char fail_log[64];
+            uint32_t f_pos = 0;
+            step6_append_str(fail_log, sizeof(fail_log), &f_pos, "Msg ");
+            step6_append_u32(fail_log, sizeof(fail_log), &f_pos, (uint32_t)msg_id);
+            step6_append_str(fail_log, sizeof(fail_log), &f_pos, " Frag ");
+            step6_append_u32(fail_log, sizeof(fail_log), &f_pos, (uint32_t)idx);
+            step6_append_str(fail_log, sizeof(fail_log), &f_pos, "/");
+            step6_append_u32(fail_log, sizeof(fail_log), &f_pos, (uint32_t)total_frags);
+            step6_append_str(fail_log, sizeof(fail_log), &f_pos, ": TX=OK ACK=FAIL");
+            log_line(TAG_TEST, fail_log);
+
+            /* Hard rule: do not send later fragment if earlier fragment was not acknowledged */
+            return 0;
+        }
+
+        delay_ms(25U);
+    }
+
+    if (report->frags_ack_valid == total_frags) {
+        report->all_acked = 1U;
+        return 1;
+    }
+    return 0;
+}
+
+static void step6_data_mock_run(void) {
+    log_line(TAG_BOOT, "node=A test=STAGE6_DATA_MOCK link=USART2 mock_rf=simulated");
+    log_line(TAG_BOOT, "RF bypassed: SX1278 uninitialized; testing DATA messaging over USART2 (one-shot)");
+
+    /* Test-only startup delay to allow Node B to complete initialization */
+    delay_ms(STEP6_STARTUP_DELAY_MS);
+    air_mock_flush();
+    air_mock_clear_diag();
+
+    if (fhss_verify_vectors() == OK) {
+        log_line(TAG_TEST, "vectors PASS");
+    } else {
+        log_line(TAG_TEST, "vectors FAIL");
+        while (1) { __asm__ volatile ("nop"); }
+    }
+
+    log_line(TAG_TEST, "=== Stage 6 DATA Mock Messaging Test (One-Shot) Start ===");
+
+    uint8_t s_tx_seq = 0U;
+    fhss_replay_t s_rx_replay = {0, 0};
+
+    step6_msg_report_t rep1;
+    step6_msg_report_t rep2;
+
+    /* -----------------------------------------------------------------
+     * Message 1: Short, single-fragment ASCII message (12 bytes)
+     * ----------------------------------------------------------------- */
+    static const char s_msg1[] = "HELLO_NODE_B";
+    log_line(TAG_TEST, "Msg 1 (single-frag): len=12 msg_id=1 total=1 \"HELLO_NODE_B\"");
+
+    int m1_ok = step6_send_message(s_msg1, 1U, &s_tx_seq, &s_rx_replay, &rep1);
+
+    log_line(TAG_TEST, "Msg 1 Peer Reconstruction Confirmation: NOT_SUPPORTED (protocol lacks peer completion confirmation)");
+    log_line(TAG_TEST, "Msg 1 Payload Match Verification: UNVERIFIABLE_OVER_AIR (no reverse data path)");
+    if (m1_ok) {
+        log_line(TAG_TEST, "Msg 1 Result: PASS (all fragments ACKed)");
+    } else {
+        log_line(TAG_TEST, "Msg 1 Result: FAIL");
+    }
+
+    delay_ms(100U);
+
+    /* -----------------------------------------------------------------
+     * Message 2: Multi-fragment ASCII message (34 bytes, 3 fragments)
+     * ----------------------------------------------------------------- */
+    static const char s_msg2[] = "FHSS_DATA_TRANSPORT_TEST_PACKET_#2";
+    log_line(TAG_TEST, "Msg 2 (multi-frag): len=34 msg_id=2 total=3 \"FHSS_DATA_TRANSPORT_TEST_PACKET_#2\"");
+
+    int m2_ok = step6_send_message(s_msg2, 2U, &s_tx_seq, &s_rx_replay, &rep2);
+
+    log_line(TAG_TEST, "Msg 2 Peer Reconstruction Confirmation: NOT_SUPPORTED (protocol lacks peer completion confirmation)");
+    log_line(TAG_TEST, "Msg 2 Payload Match Verification: UNVERIFIABLE_OVER_AIR (no reverse data path)");
+    if (m2_ok) {
+        log_line(TAG_TEST, "Msg 2 Result: PASS (all 3 fragments ACKed)");
+    } else {
+        log_line(TAG_TEST, "Msg 2 Result: FAIL");
+    }
+
+    /* -----------------------------------------------------------------
+     * Final Summary Reporting
+     * ----------------------------------------------------------------- */
+    log_line(TAG_TEST, "=== Stage 6 DATA Mock Messaging Summary ===");
+
+    /* Summary for Message 1 */
+    char s1_buf[96];
+    uint32_t sp = 0;
+    step6_append_str(s1_buf, sizeof(s1_buf), &sp, "Message 1 (single-frag, len=");
+    step6_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.msg_len);
+    step6_append_str(s1_buf, sizeof(s1_buf), &sp, ", msg_id=1): TX=");
+    step6_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.frags_tx_ok);
+    step6_append_str(s1_buf, sizeof(s1_buf), &sp, "/");
+    step6_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.total_frags);
+    step6_append_str(s1_buf, sizeof(s1_buf), &sp, " ACK=");
+    step6_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.frags_ack_valid);
+    step6_append_str(s1_buf, sizeof(s1_buf), &sp, "/");
+    step6_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.total_frags);
+    log_line(TAG_TEST, s1_buf);
+    log_line(TAG_TEST, "  Peer reconstruction confirmed: NO (protocol limitation: no peer completion confirmation)");
+    log_line(TAG_TEST, "  Peer payload match verified: NO (protocol limitation: no reverse payload verification)");
+
+    /* Summary for Message 2 */
+    char s2_buf[96];
+    sp = 0;
+    step6_append_str(s2_buf, sizeof(s2_buf), &sp, "Message 2 (multi-frag, len=");
+    step6_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.msg_len);
+    step6_append_str(s2_buf, sizeof(s2_buf), &sp, ", msg_id=2): TX=");
+    step6_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.frags_tx_ok);
+    step6_append_str(s2_buf, sizeof(s2_buf), &sp, "/");
+    step6_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.total_frags);
+    step6_append_str(s2_buf, sizeof(s2_buf), &sp, " ACK=");
+    step6_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.frags_ack_valid);
+    step6_append_str(s2_buf, sizeof(s2_buf), &sp, "/");
+    step6_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.total_frags);
+    log_line(TAG_TEST, s2_buf);
+    log_line(TAG_TEST, "  Peer reconstruction confirmed: NO (protocol limitation: no peer completion confirmation)");
+    log_line(TAG_TEST, "  Peer payload match verified: NO (protocol limitation: no reverse payload verification)");
+
+    if (m1_ok && m2_ok) {
+        log_line(TAG_TEST, "Stage 6 DATA Messaging Test Complete: ALL FRAGMENTS TRANSMITTED AND ACKED (one-shot)");
+    } else {
+        log_line(TAG_TEST, "Stage 6 DATA Messaging Test Complete: FAIL (one-shot)");
+    }
+
+    /* Idle forever; do not restart sequence numbers */
+    log_line(TAG_BOOT, "Stage 6 idle; reset board to rerun");
+    uint32_t idle_sec = 0U;
+    while (1) {
+        delay_ms(5000U);
+        idle_sec += 5U;
+        char idle_buf[48];
+        char num_idle[12];
+        char *ip = idle_buf;
+        const char *m = "idle ("; while (*m != '\0') *ip++ = *m++;
+        uint32_to_ascii(idle_sec, num_idle); const char *sn = num_idle; while (*sn != '\0') *ip++ = *sn++;
+        m = "s); press RESET to rerun"; while (*m != '\0') *ip++ = *m++;
+        *ip = '\0';
+        log_line(TAG_BOOT, idle_buf);
+    }
+}
+#endif
+
+#ifdef STEP7_ARQ_MOCK
+/*
+ * Stage 7: Node A DATA Retransmission and ACK-Loss Recovery over USART2 Mock Transport
+ *
+ * Exercises ARQ retransmission recovery using the frozen FHSS protocol over the wired
+ * USART2 mock transport (SX1278 radios bypassed).
+ * Schedule:
+ *   Step 1: Msg 1, ID 1, frag 0/1, seq 0, attempt 1 -> ACK bitmap 0x01
+ *   Step 2: Msg 2, ID 2, frag 0/3, seq 1, attempt 1 -> ACK bitmap 0x01
+ *   Step 3: Msg 2, ID 2, frag 1/3, seq 2, attempt 1 -> ACK suppressed by Node B (timeout)
+ *   Step 4: Msg 2, ID 2, frag 1/3, seq 3, attempt 2 (RETRY) -> fresh seq 3, recomputed tag -> ACK bitmap 0x03
+ *   Step 5: Msg 2, ID 2, frag 2/3, seq 4, attempt 1 -> ACK bitmap 0x07 (message complete)
+ *
+ * Rules:
+ *   - Sequence increments on every transmission attempt (including retries).
+ *   - Packet rebuilt with fresh sequence number, masked hop, and recomputed tag.
+ *   - Never resend stale frame bytes.
+ *   - Do not flush queued ACKs before retries.
+ *   - Maximum 3 attempts per fragment.
+ *   - Abort remaining fragments if retry limit exceeded.
+ */
+
+#define STEP7_ACK_TIMEOUT_MS   150U
+#define STEP7_STARTUP_DELAY_MS 500U
+#define STEP7_MAX_ATTEMPTS     3U
+
+typedef enum {
+    STEP7_ACK_OK = 0,
+    STEP7_ACK_TIMEOUT,
+    STEP7_ACK_BAD_TAG,
+    STEP7_ACK_REPLAY,
+    STEP7_ACK_BAD_TYPE,
+    STEP7_ACK_BAD_MSG_ID,
+    STEP7_ACK_BAD_TOTAL,
+    STEP7_ACK_FRAG_NOT_ACKED,
+    STEP7_ACK_BAD_LEN
+} step7_ack_status_t;
+
+typedef struct {
+    step7_ack_status_t status;
+    uint8_t ack_seq;        /* Node B's independent ACK sequence number */
+    uint8_t ack_msg_id;     /* Echoed msg_id */
+    uint8_t ack_total;      /* Total fragments indicated in ACK */
+    uint8_t ack_bitmap;     /* Fragment received bitmap */
+    uint8_t ack_rssi;       /* Raw RSSI */
+} step7_ack_detail_t;
+
+typedef struct {
+    uint8_t idx;
+    uint8_t last_seq;       /* Sequence number used in final attempt */
+    uint8_t last;
+    uint8_t chunk_len;
+    uint8_t attempts;       /* Number of attempts made */
+    uint8_t ack_valid;
+    step7_ack_detail_t ack_detail;
+} step7_frag_report_t;
+
+typedef struct {
+    const char *text;
+    uint8_t msg_id;
+    uint8_t msg_len;
+    uint8_t total_frags;
+    uint8_t frags_tx_ok;
+    uint8_t frags_ack_valid;
+    uint8_t total_retries;
+    uint8_t all_acked;
+    step7_frag_report_t frags[MAX_FRAGMENTS];
+} step7_msg_report_t;
+
+static void step7_uint8_to_hex(uint8_t val, char *buf) {
+    static const char hex_digits[] = "0123456789ABCDEF";
+    buf[0] = '0';
+    buf[1] = 'x';
+    buf[2] = hex_digits[(val >> 4) & 0x0FU];
+    buf[3] = hex_digits[val & 0x0FU];
+    buf[4] = '\0';
+}
+
+static void step7_append_str(char *buf, uint32_t max_len, uint32_t *pos, const char *s) {
+    if (s == (const char *)0) return;
+    while (*s != '\0' && (*pos + 1U) < max_len) {
+        buf[*pos] = *s++;
+        (*pos)++;
+    }
+    buf[*pos] = '\0';
+}
+
+static void step7_append_u32(char *buf, uint32_t max_len, uint32_t *pos, uint32_t val) {
+    char num[12];
+    uint32_to_ascii(val, num);
+    step7_append_str(buf, max_len, pos, num);
+}
+
+static void step7_append_hex8(char *buf, uint32_t max_len, uint32_t *pos, uint8_t val) {
+    char hex[5];
+    step7_uint8_to_hex(val, hex);
+    step7_append_str(buf, max_len, pos, hex);
+}
+
+static void step7_log_arq_tx(uint8_t msg_id, uint8_t frag_idx, uint8_t seq, uint8_t attempt) {
+    char buf[64];
+    uint32_t pos = 0;
+    step7_append_str(buf, sizeof(buf), &pos, "TX msg=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)msg_id);
+    step7_append_str(buf, sizeof(buf), &pos, " frag=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)frag_idx);
+    step7_append_str(buf, sizeof(buf), &pos, " seq=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)seq);
+    step7_append_str(buf, sizeof(buf), &pos, " attempt=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)attempt);
+    log_line(TAG_ARQ, buf);
+}
+
+static void step7_log_ack_timeout(uint8_t msg_id, uint8_t frag_idx, uint8_t seq) {
+    char buf[64];
+    uint32_t pos = 0;
+    step7_append_str(buf, sizeof(buf), &pos, "ACK_TIMEOUT msg=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)msg_id);
+    step7_append_str(buf, sizeof(buf), &pos, " frag=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)frag_idx);
+    step7_append_str(buf, sizeof(buf), &pos, " seq=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)seq);
+    log_line(TAG_ARQ, buf);
+}
+
+static void step7_log_arq_retry(uint8_t msg_id, uint8_t frag_idx, uint8_t seq, uint8_t attempt) {
+    char buf[64];
+    uint32_t pos = 0;
+    step7_append_str(buf, sizeof(buf), &pos, "RETRY msg=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)msg_id);
+    step7_append_str(buf, sizeof(buf), &pos, " frag=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)frag_idx);
+    step7_append_str(buf, sizeof(buf), &pos, " seq=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)seq);
+    step7_append_str(buf, sizeof(buf), &pos, " attempt=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)attempt);
+    log_line(TAG_ARQ, buf);
+}
+
+static void step7_log_ack_valid(uint8_t msg_id, uint8_t bitmap) {
+    char buf[64];
+    uint32_t pos = 0;
+    step7_append_str(buf, sizeof(buf), &pos, "ACK msg=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)msg_id);
+    step7_append_str(buf, sizeof(buf), &pos, " bitmap=");
+    step7_append_hex8(buf, sizeof(buf), &pos, bitmap);
+    step7_append_str(buf, sizeof(buf), &pos, " -> VALID");
+    log_line(TAG_RX, buf);
+}
+
+static void step7_log_ack_fail(uint8_t msg_id, const step7_ack_detail_t *detail) {
+    char buf[80];
+    uint32_t pos = 0;
+    step7_append_str(buf, sizeof(buf), &pos, "ACK msg_id=");
+    step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)msg_id);
+    step7_append_str(buf, sizeof(buf), &pos, " -> FAIL (");
+
+    switch (detail->status) {
+        case STEP7_ACK_TIMEOUT:
+            step7_append_str(buf, sizeof(buf), &pos, "TIMEOUT");
+            break;
+        case STEP7_ACK_BAD_TAG:
+            step7_append_str(buf, sizeof(buf), &pos, "BAD_TAG");
+            break;
+        case STEP7_ACK_REPLAY:
+            step7_append_str(buf, sizeof(buf), &pos, "REPLAY");
+            break;
+        case STEP7_ACK_BAD_TYPE:
+            step7_append_str(buf, sizeof(buf), &pos, "BAD_TYPE");
+            break;
+        case STEP7_ACK_BAD_MSG_ID:
+            step7_append_str(buf, sizeof(buf), &pos, "WRONG_MSG_ID=");
+            step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)detail->ack_msg_id);
+            break;
+        case STEP7_ACK_BAD_TOTAL:
+            step7_append_str(buf, sizeof(buf), &pos, "WRONG_TOTAL=");
+            step7_append_u32(buf, sizeof(buf), &pos, (uint32_t)detail->ack_total);
+            break;
+        case STEP7_ACK_FRAG_NOT_ACKED:
+            step7_append_str(buf, sizeof(buf), &pos, "BITMAP_BIT_CLEAR bm=");
+            step7_append_hex8(buf, sizeof(buf), &pos, detail->ack_bitmap);
+            break;
+        case STEP7_ACK_BAD_LEN:
+            step7_append_str(buf, sizeof(buf), &pos, "BAD_LEN");
+            break;
+        default:
+            step7_append_str(buf, sizeof(buf), &pos, "ERROR");
+            break;
+    }
+    step7_append_str(buf, sizeof(buf), &pos, ")");
+    log_line(TAG_RX, buf);
+}
+
+static step7_ack_status_t step7_wait_ack(uint8_t tuned_ch, uint8_t exp_msg_id,
+                                         uint8_t exp_total, uint8_t exp_idx,
+                                         uint32_t timeout_ms,
+                                         fhss_replay_t *replay,
+                                         step7_ack_detail_t *detail) {
+    uint32_t t_start = millis();
+    step7_ack_status_t last_status = STEP7_ACK_TIMEOUT;
+
+    if (detail != (step7_ack_detail_t *)0) {
+        detail->status = STEP7_ACK_TIMEOUT;
+        detail->ack_seq = 0U;
+        detail->ack_msg_id = 0U;
+        detail->ack_total = 0U;
+        detail->ack_bitmap = 0U;
+        detail->ack_rssi = 0U;
+    }
+
+    while ((millis() - t_start) < timeout_ms) {
+        uint8_t rx_buf[MAX_FRAME_LEN];
+        uint8_t rx_len = 0U;
+        int poll_res = air_rx_poll(tuned_ch, rx_buf, &rx_len);
+
+        if (poll_res == (int)OK) {
+            fhss_frame_t parsed;
+            status_t parse_res = fhss_parse_frame(rx_buf, rx_len, DIR_B_TO_A, replay, &parsed);
+
+            if (parse_res == OK) {
+                if (detail != (step7_ack_detail_t *)0) {
+                    detail->ack_seq = parsed.seq;
+                    detail->ack_msg_id = parsed.msg_id;
+                    detail->ack_total = parsed.total;
+                    detail->ack_bitmap = (parsed.payload_len >= 1U) ? parsed.payload[0] : 0U;
+                    detail->ack_rssi = (parsed.payload_len >= 2U) ? parsed.payload[1] : 0U;
+                }
+
+                if (parsed.type != PKT_TYPE_ACK) {
+                    last_status = STEP7_ACK_BAD_TYPE;
+                } else if (parsed.msg_id != exp_msg_id) {
+                    last_status = STEP7_ACK_BAD_MSG_ID;
+                } else if (parsed.total != exp_total) {
+                    last_status = STEP7_ACK_BAD_TOTAL;
+                } else if ((parsed.payload[0] & (1U << exp_idx)) == 0U) {
+                    last_status = STEP7_ACK_FRAG_NOT_ACKED;
+                } else {
+                    if (detail != (step7_ack_detail_t *)0) {
+                        detail->status = STEP7_ACK_OK;
+                    }
+                    return STEP7_ACK_OK;
+                }
+            } else if (parse_res == ERR_TAG) {
+                last_status = STEP7_ACK_BAD_TAG;
+            } else if (parse_res == ERR_REPLAY) {
+                last_status = STEP7_ACK_REPLAY;
+            } else if (parse_res == ERR_LEN) {
+                last_status = STEP7_ACK_BAD_LEN;
+            } else {
+                last_status = STEP7_ACK_BAD_TYPE;
+            }
+        }
+        __asm__ volatile ("nop");
+    }
+
+    if (detail != (step7_ack_detail_t *)0) {
+        detail->status = last_status;
+    }
+    return last_status;
+}
+
+static int step7_send_message_arq(const char *text, uint8_t msg_id,
+                                  uint8_t *inout_seq,
+                                  fhss_replay_t *rx_replay,
+                                  step7_msg_report_t *report) {
+    if (text == (const char *)0 || inout_seq == (uint8_t *)0 ||
+        rx_replay == (fhss_replay_t *)0 || report == (step7_msg_report_t *)0) {
+        return 0;
+    }
+
+    uint8_t msg_len = 0U;
+    while (text[msg_len] != '\0') {
+        msg_len++;
+    }
+
+    uint8_t total_frags = (uint8_t)((msg_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+    if (total_frags == 0U) {
+        total_frags = 1U;
+    }
+
+    report->text = text;
+    report->msg_id = msg_id;
+    report->msg_len = msg_len;
+    report->total_frags = total_frags;
+    report->frags_tx_ok = 0U;
+    report->frags_ack_valid = 0U;
+    report->total_retries = 0U;
+    report->all_acked = 0U;
+
+    for (uint8_t idx = 0U; idx < total_frags; idx++) {
+        uint8_t offset = (uint8_t)(idx * MAX_PAYLOAD);
+        uint8_t rem = (uint8_t)(msg_len - offset);
+        uint8_t chunk_len = (rem > MAX_PAYLOAD) ? MAX_PAYLOAD : rem;
+        uint8_t last = (idx == (total_frags - 1U)) ? 1U : 0U;
+
+        step7_frag_report_t *frag_rep = &report->frags[idx];
+        frag_rep->idx = idx;
+        frag_rep->last = last;
+        frag_rep->chunk_len = chunk_len;
+        frag_rep->attempts = 0U;
+        frag_rep->ack_valid = 0U;
+
+        int frag_success = 0;
+
+        for (uint8_t attempt = 1U; attempt <= STEP7_MAX_ATTEMPTS; attempt++) {
+            uint8_t seq = *inout_seq;
+            frag_rep->last_seq = seq;
+            frag_rep->attempts = attempt;
+
+            uint8_t tx_frame[MAX_FRAME_LEN];
+            uint8_t tx_len = 0U;
+            const uint8_t *payload_ptr = (const uint8_t *)&text[offset];
+
+            status_t build_st = fhss_build_data(seq, msg_id, total_frags, idx, last,
+                                                0U, 0U, payload_ptr, chunk_len,
+                                                tx_frame, &tx_len);
+            if (build_st != OK) {
+                log_line(TAG_ERR, "fhss_build_data failed");
+                return 0;
+            }
+
+            /* Log attempt per requirement:
+             * attempt 1: [ARQ] TX msg=X frag=Y seq=Z attempt=1
+             * attempt > 1: [ARQ] RETRY msg=X frag=Y seq=Z attempt=N
+             */
+            if (attempt == 1U) {
+                step7_log_arq_tx(msg_id, idx, seq, attempt);
+            } else {
+                step7_log_arq_retry(msg_id, idx, seq, attempt);
+                report->total_retries++;
+            }
+
+            /* Rule 8: Do NOT flush potentially valid queued ACKs indiscriminately before retries */
+            int tx_res = air_tx(0U, tx_frame, tx_len);
+            if (tx_res != (int)OK) {
+                log_line(TAG_ERR, "air_tx failed");
+                return 0;
+            }
+
+            /* Sequence number increments for EVERY transmitted DATA packet, including retransmission */
+            (*inout_seq)++;
+
+            /* Wait for standard FHSS ACK */
+            step7_ack_status_t ack_res = step7_wait_ack(0U, msg_id, total_frags, idx,
+                                                        STEP7_ACK_TIMEOUT_MS,
+                                                        rx_replay,
+                                                        &frag_rep->ack_detail);
+
+            if (ack_res == STEP7_ACK_OK) {
+                frag_rep->ack_valid = 1U;
+                step7_log_ack_valid(msg_id, frag_rep->ack_detail.ack_bitmap);
+
+                char pass_log[64];
+                uint32_t p_pos = 0;
+                step7_append_str(pass_log, sizeof(pass_log), &p_pos, "Msg ");
+                step7_append_u32(pass_log, sizeof(pass_log), &p_pos, (uint32_t)msg_id);
+                step7_append_str(pass_log, sizeof(pass_log), &p_pos, " Frag ");
+                step7_append_u32(pass_log, sizeof(pass_log), &p_pos, (uint32_t)idx);
+                step7_append_str(pass_log, sizeof(pass_log), &p_pos, "/");
+                step7_append_u32(pass_log, sizeof(pass_log), &p_pos, (uint32_t)total_frags);
+                step7_append_str(pass_log, sizeof(pass_log), &p_pos, ": TX=OK ACK=VALID (attempts=");
+                step7_append_u32(pass_log, sizeof(pass_log), &p_pos, (uint32_t)attempt);
+                step7_append_str(pass_log, sizeof(pass_log), &p_pos, ")");
+                log_line(TAG_TEST, pass_log);
+
+                frag_success = 1;
+                break;
+            } else if (ack_res == STEP7_ACK_TIMEOUT) {
+                step7_log_ack_timeout(msg_id, idx, seq);
+                /* If attempts remain, loop continues to retry with fresh seq */
+            } else {
+                /* Invalid or corrupted ACK received */
+                step7_log_ack_fail(msg_id, &frag_rep->ack_detail);
+            }
+
+            delay_ms(25U);
+        }
+
+        if (!frag_success) {
+            /* Abort remaining fragments if required ACK cannot be obtained after retry limit */
+            char fail_log[80];
+            uint32_t f_pos = 0;
+            step7_append_str(fail_log, sizeof(fail_log), &f_pos, "Msg ");
+            step7_append_u32(fail_log, sizeof(fail_log), &f_pos, (uint32_t)msg_id);
+            step7_append_str(fail_log, sizeof(fail_log), &f_pos, " Frag ");
+            step7_append_u32(fail_log, sizeof(fail_log), &f_pos, (uint32_t)idx);
+            step7_append_str(fail_log, sizeof(fail_log), &f_pos, " failed after max retries; aborting message");
+            log_line(TAG_ARQ, fail_log);
+            return 0;
+        }
+
+        report->frags_tx_ok++;
+        report->frags_ack_valid++;
+        delay_ms(25U);
+    }
+
+    if (report->frags_ack_valid == total_frags) {
+        report->all_acked = 1U;
+        return 1;
+    }
+    return 0;
+}
+
+static void step7_arq_mock_run(void) {
+    log_line(TAG_BOOT, "node=A test=STAGE7_ARQ_MOCK link=USART2 mock_rf=simulated");
+    log_line(TAG_BOOT, "RF bypassed: SX1278 uninitialized; testing ARQ retransmission over USART2 (one-shot)");
+
+    /* Test-only startup delay to allow Node B to complete initialization */
+    delay_ms(STEP7_STARTUP_DELAY_MS);
+    air_mock_flush();
+    air_mock_clear_diag();
+
+    if (fhss_verify_vectors() == OK) {
+        log_line(TAG_TEST, "vectors PASS");
+    } else {
+        log_line(TAG_TEST, "vectors FAIL");
+        while (1) { __asm__ volatile ("nop"); }
+    }
+
+    log_line(TAG_TEST, "=== Stage 7 ARQ Mock Messaging Test (One-Shot) Start ===");
+
+    uint8_t s_tx_seq = 0U;
+    fhss_replay_t s_rx_replay = {0, 0};
+
+    step7_msg_report_t rep1;
+    step7_msg_report_t rep2;
+
+    /* -----------------------------------------------------------------
+     * Message 1: Short, single-fragment ASCII message (12 bytes)
+     * ----------------------------------------------------------------- */
+    static const char s_msg1[] = "HELLO_NODE_B";
+    log_line(TAG_TEST, "Msg 1 (single-frag): len=12 msg_id=1 total=1 \"HELLO_NODE_B\"");
+
+    int m1_ok = step7_send_message_arq(s_msg1, 1U, &s_tx_seq, &s_rx_replay, &rep1);
+
+    log_line(TAG_TEST, "Msg 1 Peer Reconstruction Confirmation: NOT_SUPPORTED (protocol lacks peer completion confirmation)");
+    log_line(TAG_TEST, "Msg 1 Payload Match Verification: UNVERIFIABLE_OVER_AIR (no reverse data path)");
+    if (m1_ok) {
+        log_line(TAG_TEST, "Msg 1 Result: PASS (all fragments ACKed)");
+    } else {
+        log_line(TAG_TEST, "Msg 1 Result: FAIL");
+    }
+
+    delay_ms(100U);
+
+    /* -----------------------------------------------------------------
+     * Message 2: Multi-fragment ASCII message (34 bytes, 3 fragments)
+     * ----------------------------------------------------------------- */
+    static const char s_msg2[] = "FHSS_DATA_TRANSPORT_TEST_PACKET_#2";
+    log_line(TAG_TEST, "Msg 2 (multi-frag): len=34 msg_id=2 total=3 \"FHSS_DATA_TRANSPORT_TEST_PACKET_#2\"");
+
+    int m2_ok = step7_send_message_arq(s_msg2, 2U, &s_tx_seq, &s_rx_replay, &rep2);
+
+    log_line(TAG_TEST, "Msg 2 Peer Reconstruction Confirmation: NOT_SUPPORTED (protocol lacks peer completion confirmation)");
+    log_line(TAG_TEST, "Msg 2 Payload Match Verification: UNVERIFIABLE_OVER_AIR (no reverse data path)");
+    if (m2_ok) {
+        log_line(TAG_TEST, "Msg 2 Result: PASS (all 3 fragments ACKed, 1 retry recovered)");
+    } else {
+        log_line(TAG_TEST, "Msg 2 Result: FAIL");
+    }
+
+    /* -----------------------------------------------------------------
+     * Final Summary Reporting
+     * ----------------------------------------------------------------- */
+    log_line(TAG_TEST, "=== Stage 7 ARQ Mock Test Summary ===");
+
+    /* Summary for Message 1 */
+    char s1_buf[96];
+    uint32_t sp = 0;
+    step7_append_str(s1_buf, sizeof(s1_buf), &sp, "Message 1 (single-frag, len=");
+    step7_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.msg_len);
+    step7_append_str(s1_buf, sizeof(s1_buf), &sp, ", msg_id=1): TX=");
+    step7_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.frags_tx_ok);
+    step7_append_str(s1_buf, sizeof(s1_buf), &sp, "/");
+    step7_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.total_frags);
+    step7_append_str(s1_buf, sizeof(s1_buf), &sp, " ACK=");
+    step7_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.frags_ack_valid);
+    step7_append_str(s1_buf, sizeof(s1_buf), &sp, "/");
+    step7_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.total_frags);
+    step7_append_str(s1_buf, sizeof(s1_buf), &sp, " retries=");
+    step7_append_u32(s1_buf, sizeof(s1_buf), &sp, (uint32_t)rep1.total_retries);
+    log_line(TAG_TEST, s1_buf);
+    log_line(TAG_TEST, "  Peer reconstruction confirmed: NO (protocol limitation: no peer completion confirmation)");
+    log_line(TAG_TEST, "  Peer payload match verified: NO (protocol limitation: no reverse payload verification)");
+
+    /* Summary for Message 2 */
+    char s2_buf[96];
+    sp = 0;
+    step7_append_str(s2_buf, sizeof(s2_buf), &sp, "Message 2 (multi-frag, len=");
+    step7_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.msg_len);
+    step7_append_str(s2_buf, sizeof(s2_buf), &sp, ", msg_id=2): TX=");
+    step7_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.frags_tx_ok);
+    step7_append_str(s2_buf, sizeof(s2_buf), &sp, "/");
+    step7_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.total_frags);
+    step7_append_str(s2_buf, sizeof(s2_buf), &sp, " ACK=");
+    step7_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.frags_ack_valid);
+    step7_append_str(s2_buf, sizeof(s2_buf), &sp, "/");
+    step7_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.total_frags);
+    step7_append_str(s2_buf, sizeof(s2_buf), &sp, " retries=");
+    step7_append_u32(s2_buf, sizeof(s2_buf), &sp, (uint32_t)rep2.total_retries);
+    log_line(TAG_TEST, s2_buf);
+    log_line(TAG_TEST, "  Peer reconstruction confirmed: NO (protocol limitation: no peer completion confirmation)");
+    log_line(TAG_TEST, "  Peer payload match verified: NO (protocol limitation: no reverse payload verification)");
+
+    if (m1_ok && m2_ok && rep2.total_retries == 1U) {
+        log_line(TAG_TEST, "Stage 7 ARQ Test Complete: ALL FRAGMENTS ACKED WITH 1 RETRY RECOVERY (one-shot)");
+    } else if (m1_ok && m2_ok) {
+        log_line(TAG_TEST, "Stage 7 ARQ Test Complete: ALL FRAGMENTS TRANSMITTED AND ACKED (one-shot)");
+    } else {
+        log_line(TAG_TEST, "Stage 7 ARQ Test Complete: FAIL (one-shot)");
+    }
+
+    /* Idle forever; do not restart sequence numbers */
+    log_line(TAG_BOOT, "Stage 7 idle; reset board to rerun");
+    uint32_t idle_sec = 0U;
+    while (1) {
+        delay_ms(5000U);
+        idle_sec += 5U;
+        char idle_buf[48];
+        char num_idle[12];
+        char *ip = idle_buf;
+        const char *m = "idle ("; while (*m != '\0') *ip++ = *m++;
+        uint32_to_ascii(idle_sec, num_idle); const char *sn = num_idle; while (*sn != '\0') *ip++ = *sn++;
+        m = "s); press RESET to rerun"; while (*m != '\0') *ip++ = *m++;
+        *ip = '\0';
+        log_line(TAG_BOOT, idle_buf);
+    }
+}
+#endif
+
 /*
  * Node A (Transmitter and Hop Master)
  * Step A2: SPI1 Master Mode 0, RegVersion check, retry logic, and safe halt.
@@ -1483,7 +2492,11 @@ static void step5_fault_test_run(void) {
 int main(void) {
     baremetal_init();
 
-#if defined(STEP5_FAULT_TEST)
+#if defined(STEP7_ARQ_MOCK)
+    step7_arq_mock_run();
+#elif defined(STEP6_DATA_MOCK)
+    step6_data_mock_run();
+#elif defined(STEP5_FAULT_TEST)
     step5_fault_test_run();
 #elif defined(STEP4_RADIO_SPI_DIAG)
     step4_radio_spi_diag_run();
