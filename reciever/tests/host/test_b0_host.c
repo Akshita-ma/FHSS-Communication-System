@@ -679,8 +679,276 @@ static void test_step4_spi_diag(void) {
     printf("[HOST_TEST] test_step4_spi_diag: PASS\n");
 }
 
+#include "step5_fault_test.h"
+
+static void make_test_envelope(
+    uint8_t ch,
+    const fhss_packet_t *pkt,
+    uint8_t corrupt_env_crc,
+    uint8_t corrupt_tag,
+    uint8_t *env_out,
+    uint16_t *env_len_out
+) {
+    uint8_t wire[32];
+    uint8_t wire_len = 0;
+    assert(fhss_build_packet(pkt, wire, &wire_len) == OK);
+    if (corrupt_tag) {
+        wire[5] ^= 0xA5; /* Corrupt byte 5 (TAG) */
+    }
+    env_out[0] = 0x7E;
+    env_out[1] = ch;
+    env_out[2] = wire_len;
+    memcpy(&env_out[3], wire, wire_len);
+    uint8_t crc = crc8_smbus_cont(&env_out[1], (uint8_t)(2 + wire_len), CRC8_SMBUS_INIT);
+    if (corrupt_env_crc) {
+        crc ^= 0x55;
+    }
+    env_out[3 + wire_len] = crc;
+    *env_len_out = (uint16_t)(4 + wire_len);
+}
+
+static void test_step5_fault_test(void) {
+    step5_harness_t harness;
+    step5_harness_init(&harness);
+    assert(harness.suppress_ack_seq == 7); /* Node A schedule: seq 7 has ACK suppressed */
+    assert(harness.cycle_done == 0);
+
+    fhss_packet_t ack;
+    uint8_t tx_ch = 0;
+    fhss_packet_t rx_pkt;
+    uint8_t env[48];
+    uint16_t env_len = 0;
+    step5_rx_outcome_t outcome;
+    uint16_t avail = 0;
+
+    /* Base test packet template (DATA) */
+    fhss_packet_t p;
+    p.ver_type = (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_DATA);
+    p.msg_id = 1;
+    p.frag = 0; /* TOTAL=1, IDX=0, LAST=0 */
+    p.payload[0] = 'T';
+    p.payload_len = 1;
+
+    /* =========================================================================
+     * Case 1: Valid channel-0 packets with sequence values 254, 255, 0, 1.
+     * Must be accepted under replay-window rules including wraparound.
+     * ========================================================================= */
+    const uint8_t c1_seqs[4] = {254, 255, 0, 1};
+    for (int i = 0; i < 4; i++) {
+        mock_rx_reset();
+        p.seq = c1_seqs[i];
+        p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+        make_test_envelope(0, &p, 0, 0, env, &env_len);
+        mock_rx_push(env, env_len);
+
+        avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+        outcome = step5_harness_process_incoming(
+            &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+        );
+        assert(outcome == STEP5_RX_PASS_ACK_SENT);
+        assert(harness.have_last == 1);
+        assert(harness.last_seq == c1_seqs[i]);
+        assert(tx_ch == 0);
+        assert(ack.ver_type == (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_ACK));
+        assert(ack.msg_id == 1);
+    }
+    assert(harness.rx_accept_count == 4);
+    assert(harness.tx_ack_count == 4);
+
+    /* =========================================================================
+     * Case 2: Sequence 2 with deliberately corrupted outer envelope CRC.
+     * Reject it, do NOT transmit ACK, do NOT advance last_seq.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 2;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0, &p, 1 /* corrupt env crc */, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_ERR_ENV_CRC);
+    assert(harness.last_seq == 1); /* Retained previous sequence */
+    assert(harness.last_was_fault == 1);
+    assert(harness.env_crc_err_count == 1);
+    assert(harness.tx_ack_count == 4); /* No ACK sent */
+
+    /* =========================================================================
+     * Case 3: Sequence 3 with invalid protocol TAG with valid envelope CRC.
+     * Reject it, do NOT transmit ACK, do NOT advance last_seq.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 3;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0, &p, 0, 1 /* corrupt tag */, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_REJECT_BAD_TAG);
+    assert(harness.last_seq == 1);
+    assert(harness.last_was_fault == 1);
+    assert(harness.proto_bad_tag_count == 1);
+    assert(harness.tx_ack_count == 4);
+
+    /* =========================================================================
+     * Case 4: Sequence 3 again: corrected valid frame.
+     * Accept and ACK it, verify post-fault recovery.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 3;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0, &p, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_PASS_ACK_SENT);
+    assert(harness.last_seq == 3);
+    assert(harness.rx_accept_count == 5);
+    assert(harness.tx_ack_count == 5);
+
+    /* =========================================================================
+     * Case 5: Sequence 4 twice: first accepted and ACKed; duplicate rejected without ACK.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 4;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0, &p, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    /* First copy */
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_PASS_ACK_SENT);
+    assert(harness.last_seq == 4);
+    assert(harness.rx_accept_count == 6);
+    assert(harness.tx_ack_count == 6);
+
+    /* Duplicate copy (same seq=4) */
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_REJECT_REPLAY);
+    assert(harness.last_seq == 4);
+    assert(harness.last_rejected_seq == 4);
+    assert(harness.proto_replay_count == 1);
+    assert(harness.tx_ack_count == 6); /* No new ACK */
+
+    /* =========================================================================
+     * Case 6: Sequence 5 on envelope channel 1: reject without ACK.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 5;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(1 /* channel 1 */, &p, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_REJECT_WRONG_CH);
+    assert(harness.last_seq == 4); /* Seq 5 rejected, so last_seq remains 4 */
+    assert(harness.last_rejected_ch == 1);
+    assert(harness.proto_wrong_ch_count == 1);
+    assert(harness.tx_ack_count == 6); /* No ACK */
+
+    /* =========================================================================
+     * Case 7: Sequence 6 on envelope channel 0: accept and ACK.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 6;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0 /* channel 0 */, &p, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_PASS_ACK_SENT);
+    assert(harness.last_seq == 6);
+    assert(harness.rx_accept_count == 7);
+    assert(harness.tx_ack_count == 7);
+
+    /* =========================================================================
+     * Case 8: Sequence 7 on envelope channel 0: validate and accept, but deliberately suppress ACK.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 7;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0, &p, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_PASS_ACK_SUPPRESSED);
+    assert(harness.last_seq == 7); /* History MUST be updated */
+    assert(harness.rx_accept_count == 8);
+    assert(harness.ack_suppressed_count == 1);
+    assert(harness.tx_ack_count == 7); /* Suppressed: tx_ack_count stays 7 */
+    assert(harness.suppress_ack_enabled == 0); /* One-shot disarmed */
+    assert(harness.cycle_done == 0);
+
+    /* =========================================================================
+     * Case 9: Sequence 8 on envelope channel 0: accept and ACK normally.
+     * Marks one-shot test cycle completion!
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 8;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0, &p, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_PASS_ACK_SENT);
+    assert(harness.last_seq == 8);
+    assert(harness.rx_accept_count == 9);
+    assert(harness.tx_ack_count == 8); /* Normal transmission resumed */
+    assert(harness.rx_total_count == 13);
+    assert(harness.cycle_done == 1); /* One-shot cycle complete! */
+
+    /* =========================================================================
+     * Verify One-Shot Idle Behavior:
+     * When cycle is complete, incoming packets (e.g. Node A restarting at seq 254)
+     * are safely ignored without stale replay rejections or ACKs.
+     * ========================================================================= */
+    mock_rx_reset();
+    p.seq = 254;
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(p.seq, 0));
+    make_test_envelope(0, &p, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step5_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP5_RX_IDLE);
+    assert(harness.last_seq == 8); /* Stays 8 */
+    assert(harness.tx_ack_count == 8); /* No ACK sent */
+    assert(harness.proto_replay_count == 1); /* No false replay error incremented! */
+
+    printf("[HOST_TEST] test_step5_fault_test: PASS\n");
+}
+
 int main(void) {
-    printf("--- Running Node B Host Tests (Step B0, B2, Step 1, Stage 2, Stage 3 & Stage 4) ---\n");
+    printf("--- Running Node B Host Tests (Step B0, B2, Step 1, Stage 2, Stage 3, Stage 4 & Stage 5) ---\n");
     test_status_strings();
     test_channel_plan();
     test_log_formatter();
@@ -690,6 +958,7 @@ int main(void) {
     test_step2_protocol();
     test_step3_state_machine();
     test_step4_spi_diag();
+    test_step5_fault_test();
     printf("--- All Host Tests Passed ---\n");
     return 0;
 }

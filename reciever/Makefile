@@ -37,6 +37,7 @@ OBJS        = $(BUILD_DIR)/status.o \
               $(BUILD_DIR)/step2_mock.o \
               $(BUILD_DIR)/step3_fhss_mock.o \
               $(BUILD_DIR)/step4_radio_spi_diag.o \
+              $(BUILD_DIR)/step5_fault_test.o \
               $(BUILD_DIR)/node_b_rx.o
 
 # Host test sources
@@ -49,12 +50,13 @@ HOST_SRCS   = ../common/status.c \
               node_b_f4/step2_mock.c \
               node_b_f4/step3_fhss_mock.c \
               node_b_f4/step4_radio_spi_diag.c \
+              node_b_f4/step5_fault_test.c \
               tests/host/mock_hal.c \
               tests/host/test_b0_host.c
 
 HOST_CFLAGS = -Wall -Wextra -Werror -I../common -Itests/host -Inode_b_f4 -DHOST_TEST
 
-.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock step3_fhss_mock step3-fhss-mock flash_step3 flash_step3_mock step4_radio_spi_diag step4-radio-spi-diag flash_step4 flash_step4_radio_spi_diag
+.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock step3_fhss_mock step3-fhss-mock flash_step3 flash_step3_mock step4_radio_spi_diag step4-radio-spi-diag flash_step4 flash_step4_radio_spi_diag step5_fault_test step5-fault-test flash_step5 flash_step5_fault_test
 
 step1-uart-test: CFLAGS += -DSTEP1_UART_TEST
 step1-uart-test: clean
@@ -115,6 +117,22 @@ flash_step4: step4_radio_spi_diag
 	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step4_radio_spi_diag.elf verify reset exit"
 
 flash_step4_radio_spi_diag: flash_step4
+
+step5_fault_test: CFLAGS += -DSTEP5_FAULT_TEST
+step5_fault_test: clean
+	@$(MAKE) $(BUILD_DIR)/step5_fault_test.elf $(BUILD_DIR)/step5_fault_test.bin $(BUILD_DIR)/step5_fault_test.hex TARGET=step5_fault_test CFLAGS="$(CFLAGS) -DSTEP5_FAULT_TEST"
+	@cp -f $(BUILD_DIR)/step5_fault_test.elf $(BUILD_DIR)/$(ALT_TARGET).elf 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step5_fault_test.bin $(BUILD_DIR)/$(ALT_TARGET).bin 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step5_fault_test.hex $(BUILD_DIR)/$(ALT_TARGET).hex 2>/dev/null || true
+	@echo "--- Step 5 Fault Test Build complete ---"
+	$(SIZE) $(BUILD_DIR)/step5_fault_test.elf
+
+step5-fault-test: step5_fault_test
+
+flash_step5: step5_fault_test
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step5_fault_test.elf verify reset exit"
+
+flash_step5_fault_test: flash_step5
 
 demo: CFLAGS += -DDEMO_USART_LINK -DDEMO_TRACE
 ifeq ($(RF_KEYING),1)
