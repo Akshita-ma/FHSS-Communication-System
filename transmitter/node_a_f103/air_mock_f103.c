@@ -6,7 +6,7 @@
 #include "stm32f1_regs.h"
 #include "air_mock.h"
 
-#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK)
+#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST)
 
 /*
  * USART2 Mock Air Link for Node A (STM32F103)
@@ -321,6 +321,7 @@ int air_rx_poll(uint8_t ch, uint8_t *buf, uint8_t *len) {
             continue;
         }
 
+#if !defined(STEP5_FAULT_TEST)
         /* Channel error and loss model */
         int jammed = mock_is_jammed(ch);
         uint32_t r_loss = mock_rand32() % 100U;
@@ -347,6 +348,7 @@ int air_rx_poll(uint8_t ch, uint8_t *buf, uint8_t *len) {
                 continue;
             }
         }
+#endif
 
         /* Deliver frame to application */
         for (uint8_t i = 0; i < wire_len; i++) {
@@ -396,5 +398,5 @@ uint8_t air_rssi_raw(uint8_t ch) {
 
 #endif /* DEMO_USART_LINK */
 
-#endif /* DEMO_USART_LINK || STEP1_UART_TEST || STEP2_MOCK_TEST || STEP3_FHSS_MOCK */
+#endif /* DEMO_USART_LINK || STEP1_UART_TEST || STEP2_MOCK_TEST || STEP3_FHSS_MOCK || STEP5_FAULT_TEST */
 

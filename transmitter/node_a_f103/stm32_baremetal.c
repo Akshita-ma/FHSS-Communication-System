@@ -356,7 +356,7 @@ void baremetal_init(void) {
     GPIOA->BRR = (1UL << 8);
 #endif
 
-#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK)
+#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST)
     void air_mock_init(void);
     air_mock_init();
 #endif

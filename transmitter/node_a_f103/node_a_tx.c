@@ -225,13 +225,13 @@ static void selftest_pins_run(void) {
 }
 #endif
 
-#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK)
+#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST)
 #include "common/air.h"
 #include "common/fhss_protocol.h"
 #include "air_mock.h"
 #endif
 
-#if (defined(DEMO_USART_LINK) || defined(STEP3_FHSS_MOCK)) && !defined(STEP2_MOCK_TEST)
+#if (defined(DEMO_USART_LINK) || defined(STEP3_FHSS_MOCK)) && !defined(STEP2_MOCK_TEST) && !defined(STEP5_FAULT_TEST)
 
 static void log_sync_locked(uint8_t ch, uint32_t delta) {
     char buf[48];
@@ -908,6 +908,574 @@ static void step4_radio_spi_diag_run(void) {
 }
 #endif
 
+#ifdef STEP5_FAULT_TEST
+/*
+ * Stage 5 Fault-Injection and Reliability Test Harness for Node A (STM32F103)
+ *
+ * Runs 8 deterministic test cases on channel 0 over the wired USART2 mock transport:
+ * 1. Sequence wraparound: seq = 254, 255, 0, 1 -> expect valid ACKs
+ * 2. Bad envelope CRC: raw send of valid frame with corrupted wire CRC -> expect TIMEOUT
+ * 3. Bad protocol tag: fresh frame with corrupted TAG byte -> expect TIMEOUT
+ * 4. Recovery: valid fresh frame with correct TAG -> expect valid ACK
+ * 5. Duplicate replay: send identical seq 4 frame twice -> 1st ACK, 2nd TIMEOUT
+ * 6. Wrong channel: send on envelope channel 1 -> expect TIMEOUT
+ * 7. Recovery: send on channel 0 -> expect valid ACK
+ * 8. ACK suppression & recovery: seq 7 suppressed -> TIMEOUT; seq 8 -> valid ACK
+ */
+
+#define STEP5_ACK_TIMEOUT_MS 100U
+
+typedef enum {
+    ACK_STAT_OK = 0,
+    ACK_STAT_TIMEOUT,
+    ACK_STAT_ENV_CRC,
+    ACK_STAT_ENV_CH,
+    ACK_STAT_BAD_TAG,
+    ACK_STAT_REPLAY,
+    ACK_STAT_BAD_TYPE,
+    ACK_STAT_BAD_LEN,
+    ACK_STAT_BAD_VER
+} step5_ack_status_t;
+
+typedef struct {
+    step5_ack_status_t status;
+    uint8_t ack_seq;        /* Node B's ACK sequence number */
+    uint8_t ack_type;       /* Received packet type */
+    uint8_t rx_wire_ch;     /* Wire channel if mismatch */
+    uint8_t replay_last;    /* last_seq in replay state when replay rejected */
+} step5_ack_detail_t;
+
+static step5_ack_status_t step5_wait_ack(uint8_t tuned_ch, uint32_t timeout_ms,
+                                         fhss_replay_t *replay,
+                                         fhss_frame_t *out_ack,
+                                         step5_ack_detail_t *detail) {
+    uint32_t t_start = millis();
+    step5_ack_status_t last_status = ACK_STAT_TIMEOUT;
+    air_mock_clear_diag();
+
+    if (detail != (step5_ack_detail_t *)0) {
+        detail->status = ACK_STAT_TIMEOUT;
+        detail->ack_seq = 0U;
+        detail->ack_type = 0U;
+        detail->rx_wire_ch = 0U;
+        detail->replay_last = (replay != (fhss_replay_t *)0) ? replay->last_seq : 0U;
+    }
+
+    while ((millis() - t_start) < timeout_ms) {
+        uint8_t rx_buf[MAX_FRAME_LEN];
+        uint8_t rx_len = 0U;
+        int poll_res = air_rx_poll(tuned_ch, rx_buf, &rx_len);
+
+        if (poll_res == (int)OK) {
+            fhss_frame_t parsed;
+            status_t parse_res = fhss_parse_frame(rx_buf, rx_len, DIR_B_TO_A, replay, &parsed);
+
+            if (parse_res == OK) {
+                if (parsed.type == PKT_TYPE_ACK) {
+                    if (out_ack != (fhss_frame_t *)0) {
+                        *out_ack = parsed;
+                    }
+                    if (detail != (step5_ack_detail_t *)0) {
+                        detail->status = ACK_STAT_OK;
+                        detail->ack_seq = parsed.seq;
+                        detail->ack_type = parsed.type;
+                    }
+                    return ACK_STAT_OK;
+                } else {
+                    last_status = ACK_STAT_BAD_TYPE;
+                    if (detail != (step5_ack_detail_t *)0) {
+                        detail->status = ACK_STAT_BAD_TYPE;
+                        detail->ack_type = parsed.type;
+                        detail->ack_seq = parsed.seq;
+                    }
+                }
+            } else if (parse_res == ERR_TAG) {
+                last_status = ACK_STAT_BAD_TAG;
+                if (detail != (step5_ack_detail_t *)0) {
+                    detail->status = ACK_STAT_BAD_TAG;
+                    if (rx_len >= 2U) { detail->ack_seq = rx_buf[1]; }
+                }
+            } else if (parse_res == ERR_REPLAY) {
+                last_status = ACK_STAT_REPLAY;
+                if (detail != (step5_ack_detail_t *)0) {
+                    detail->status = ACK_STAT_REPLAY;
+                    if (rx_len >= 2U) { detail->ack_seq = rx_buf[1]; }
+                    detail->replay_last = (replay != (fhss_replay_t *)0) ? replay->last_seq : 0U;
+                }
+            } else if (parse_res == ERR_LEN) {
+                last_status = ACK_STAT_BAD_LEN;
+                if (detail != (step5_ack_detail_t *)0) {
+                    detail->status = ACK_STAT_BAD_LEN;
+                }
+            } else {
+                last_status = ACK_STAT_BAD_VER;
+                if (detail != (step5_ack_detail_t *)0) {
+                    detail->status = ACK_STAT_BAD_VER;
+                }
+            }
+        } else {
+            /* Check mock transport diagnostics for wire CRC or channel mismatch */
+            air_mock_diag_t diag;
+            air_mock_get_diag(&diag);
+            if (diag.crc_error_count > 0U) {
+                last_status = ACK_STAT_ENV_CRC;
+                if (detail != (step5_ack_detail_t *)0) {
+                    detail->status = ACK_STAT_ENV_CRC;
+                }
+            } else if (diag.channel_mismatch_count > 0U) {
+                last_status = ACK_STAT_ENV_CH;
+                if (detail != (step5_ack_detail_t *)0) {
+                    detail->status = ACK_STAT_ENV_CH;
+                    detail->rx_wire_ch = diag.last_mismatch_wire_ch;
+                }
+            }
+        }
+        __asm__ volatile ("nop");
+    }
+
+    if (detail != (step5_ack_detail_t *)0) {
+        detail->status = last_status;
+    }
+    return last_status;
+}
+
+static void log_step5_case(const char *case_id, uint8_t seq, const char *tx_res,
+                           const char *exp, const char *obs, int pass) {
+    char buf[112];
+    char num[12];
+    char *p = buf;
+
+    const char *s = case_id; while (*s != '\0') *p++ = *s++;
+    s = " seq="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)seq, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " tx="; while (*s != '\0') *p++ = *s++;
+    s = tx_res; while (*s != '\0') *p++ = *s++;
+    s = " exp="; while (*s != '\0') *p++ = *s++;
+    s = exp; while (*s != '\0') *p++ = *s++;
+    s = " obs="; while (*s != '\0') *p++ = *s++;
+    s = obs; while (*s != '\0') *p++ = *s++;
+    s = pass ? " -> PASS" : " -> FAIL"; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_TEST, buf);
+}
+
+static void format_obs(const step5_ack_detail_t *detail, char *out_buf) {
+    char num[12];
+    char *p = out_buf;
+
+    switch (detail->status) {
+        case ACK_STAT_OK: {
+            const char *s = "ACK(b_seq="; while (*s != '\0') *p++ = *s++;
+            uint32_to_ascii((uint32_t)detail->ack_seq, num);
+            s = num; while (*s != '\0') *p++ = *s++;
+            *p++ = ')';
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_TIMEOUT: {
+            const char *s = "TIMEOUT(no_data)"; while (*s != '\0') *p++ = *s++;
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_ENV_CRC: {
+            const char *s = "REJECT_ENV_CRC"; while (*s != '\0') *p++ = *s++;
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_ENV_CH: {
+            const char *s = "REJECT_ENV_CH(wire="; while (*s != '\0') *p++ = *s++;
+            uint32_to_ascii((uint32_t)detail->rx_wire_ch, num);
+            s = num; while (*s != '\0') *p++ = *s++;
+            *p++ = ')';
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_BAD_TAG: {
+            const char *s = "REJECT_TAG(seq="; while (*s != '\0') *p++ = *s++;
+            uint32_to_ascii((uint32_t)detail->ack_seq, num);
+            s = num; while (*s != '\0') *p++ = *s++;
+            *p++ = ')';
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_REPLAY: {
+            const char *s = "REJECT_REPLAY(seq="; while (*s != '\0') *p++ = *s++;
+            uint32_to_ascii((uint32_t)detail->ack_seq, num);
+            s = num; while (*s != '\0') *p++ = *s++;
+            s = ",last="; while (*s != '\0') *p++ = *s++;
+            uint32_to_ascii((uint32_t)detail->replay_last, num);
+            s = num; while (*s != '\0') *p++ = *s++;
+            *p++ = ')';
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_BAD_TYPE: {
+            const char *s = "REJECT_TYPE("; while (*s != '\0') *p++ = *s++;
+            uint32_to_ascii((uint32_t)detail->ack_type, num);
+            s = num; while (*s != '\0') *p++ = *s++;
+            *p++ = ')';
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_BAD_LEN: {
+            const char *s = "REJECT_LEN"; while (*s != '\0') *p++ = *s++;
+            *p = '\0';
+            break;
+        }
+        case ACK_STAT_BAD_VER:
+        default: {
+            const char *s = "REJECT_VER"; while (*s != '\0') *p++ = *s++;
+            *p = '\0';
+            break;
+        }
+    }
+}
+
+static void step5_fault_test_run(void) {
+    log_line(TAG_BOOT, "node=A test=STAGE5_FAULT_TEST link=USART2 mock_rf=simulated");
+    log_line(TAG_BOOT, "RF bypassed: SX1278 uninitialized; protocol fault testing over USART2 (one-shot)");
+
+    delay_ms(100U);
+    air_mock_flush();
+    air_mock_clear_diag();
+
+    if (fhss_verify_vectors() == OK) {
+        log_line(TAG_TEST, "vectors PASS");
+    } else {
+        log_line(TAG_TEST, "vectors FAIL");
+        while (1) { __asm__ volatile ("nop"); }
+    }
+
+    fhss_replay_t s_rx_replay = {0, 0};
+    uint32_t total_cases = 8U;
+    uint32_t passed_cases = 0U;
+
+    log_line(TAG_TEST, "=== Stage 5 Fault Test (One-Shot) Start ===");
+
+    /* -----------------------------------------------------------------
+     * Case 1: Sequence Wraparound (seq = 254, 255, 0, 1)
+     * ----------------------------------------------------------------- */
+    {
+        static const uint8_t wrap_seqs[4] = {254U, 255U, 0U, 1U};
+        int c1_pass = 1;
+
+        for (uint8_t i = 0; i < 4U; i++) {
+            uint8_t seq = wrap_seqs[i];
+            uint8_t tx_buf[MAX_FRAME_LEN];
+            uint8_t tx_len = 0U;
+            fhss_frame_t ack;
+            step5_ack_detail_t detail;
+            char obs[40];
+
+            delay_ms(50U);
+            air_mock_flush();
+            fhss_build_hop(seq, 0U, 0U, tx_buf, &tx_len);
+            int tx_res = air_tx(0U, tx_buf, tx_len);
+            const char *tx_str = (tx_res == (int)OK) ? "OK" : "FAIL";
+
+            step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+            format_obs(&detail, obs);
+            int step_pass = (detail.status == ACK_STAT_OK) && (tx_res == (int)OK);
+            if (!step_pass) {
+                c1_pass = 0;
+            }
+            log_step5_case("Case 1 (Wraparound)", seq, tx_str, "ACK", obs, step_pass);
+        }
+
+        if (c1_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 1 Wraparound: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 1 Wraparound: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Case 2: Bad Envelope CRC (seq = 2, raw corrupted CRC)
+     * ----------------------------------------------------------------- */
+    {
+        uint8_t tx_buf[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        fhss_frame_t ack;
+        step5_ack_detail_t detail;
+        char obs[40];
+
+        delay_ms(50U);
+        air_mock_flush();
+        fhss_build_hop(2U, 0U, 0U, tx_buf, &tx_len);
+
+        uint8_t raw_env[MAX_FRAME_LEN + 4U];
+        raw_env[0] = 0x7EU;
+        raw_env[1] = 0x00U; /* envelope ch 0 */
+        raw_env[2] = tx_len;
+        for (uint8_t i = 0; i < tx_len; i++) {
+            raw_env[3U + i] = tx_buf[i];
+        }
+        uint8_t crc = fhss_crc8(&raw_env[1], (uint8_t)(tx_len + 2U));
+        raw_env[3U + tx_len] = crc ^ 0xA5U; /* Deliberately corrupted wire CRC */
+        uint8_t raw_len = (uint8_t)(tx_len + 4U);
+
+        int tx_res = air_mock_send_raw(raw_env, raw_len);
+        const char *tx_str = (tx_res == (int)OK) ? "OK(raw)" : "FAIL";
+
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int step_pass = (detail.status == ACK_STAT_TIMEOUT) && (tx_res == (int)OK);
+        log_step5_case("Case 2 (Bad Envelope CRC)", 2U, tx_str, "TIMEOUT", obs, step_pass);
+
+        if (step_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 2 Bad Envelope CRC: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 2 Bad Envelope CRC: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Case 3: Bad Protocol Tag (seq = 3, corrupt tag, valid envelope CRC)
+     * ----------------------------------------------------------------- */
+    {
+        uint8_t tx_buf[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        fhss_frame_t ack;
+        step5_ack_detail_t detail;
+        char obs[40];
+
+        delay_ms(50U);
+        air_mock_flush();
+        fhss_build_hop(3U, 0U, 0U, tx_buf, &tx_len);
+        tx_buf[5] ^= 0xFFU; /* Invert integrity tag */
+
+        int tx_res = air_tx(0U, tx_buf, tx_len);
+        const char *tx_str = (tx_res == (int)OK) ? "OK" : "FAIL";
+
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int step_pass = (detail.status == ACK_STAT_TIMEOUT) && (tx_res == (int)OK);
+        log_step5_case("Case 3 (Bad Protocol Tag)", 3U, tx_str, "TIMEOUT", obs, step_pass);
+
+        if (step_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 3 Bad Protocol Tag: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 3 Bad Protocol Tag: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Case 4: Recovery (seq = 3, correct tag)
+     * ----------------------------------------------------------------- */
+    {
+        uint8_t tx_buf[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        fhss_frame_t ack;
+        step5_ack_detail_t detail;
+        char obs[40];
+
+        delay_ms(50U);
+        air_mock_flush();
+        fhss_build_hop(3U, 0U, 0U, tx_buf, &tx_len);
+
+        int tx_res = air_tx(0U, tx_buf, tx_len);
+        const char *tx_str = (tx_res == (int)OK) ? "OK" : "FAIL";
+
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int step_pass = (detail.status == ACK_STAT_OK) && (tx_res == (int)OK);
+        log_step5_case("Case 4 (Recovery)", 3U, tx_str, "ACK", obs, step_pass);
+
+        if (step_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 4 Recovery: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 4 Recovery: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Case 5: Duplicate Replay (seq = 4, sent twice)
+     * ----------------------------------------------------------------- */
+    {
+        uint8_t tx_buf[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        fhss_frame_t ack;
+        step5_ack_detail_t detail;
+        char obs[40];
+        int c5_pass = 1;
+
+        fhss_build_hop(4U, 0U, 0U, tx_buf, &tx_len);
+
+        /* 1st copy: expect valid ACK */
+        delay_ms(50U);
+        air_mock_flush();
+        int tx_res1 = air_tx(0U, tx_buf, tx_len);
+        const char *tx_str1 = (tx_res1 == (int)OK) ? "OK" : "FAIL";
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int pass1 = (detail.status == ACK_STAT_OK) && (tx_res1 == (int)OK);
+        if (!pass1) { c5_pass = 0; }
+        log_step5_case("Case 5 (Duplicate 1st)", 4U, tx_str1, "ACK", obs, pass1);
+
+        /* 2nd copy (exact duplicate): expect TIMEOUT */
+        delay_ms(50U);
+        air_mock_flush();
+        int tx_res2 = air_tx(0U, tx_buf, tx_len);
+        const char *tx_str2 = (tx_res2 == (int)OK) ? "OK" : "FAIL";
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int pass2 = (detail.status == ACK_STAT_TIMEOUT) && (tx_res2 == (int)OK);
+        if (!pass2) { c5_pass = 0; }
+        log_step5_case("Case 5 (Duplicate 2nd)", 4U, tx_str2, "TIMEOUT", obs, pass2);
+
+        if (c5_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 5 Duplicate Replay: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 5 Duplicate Replay: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Case 6: Wrong Envelope Channel (seq = 5 on ch 1, receiver on ch 0)
+     * ----------------------------------------------------------------- */
+    {
+        uint8_t tx_buf[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        fhss_frame_t ack;
+        step5_ack_detail_t detail;
+        char obs[40];
+
+        delay_ms(50U);
+        air_mock_flush();
+        fhss_build_hop(5U, 0U, 0U, tx_buf, &tx_len);
+
+        int tx_res = air_tx(1U, tx_buf, tx_len); /* envelope channel 1 */
+        const char *tx_str = (tx_res == (int)OK) ? "OK" : "FAIL";
+
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int step_pass = (detail.status == ACK_STAT_TIMEOUT) && (tx_res == (int)OK);
+        log_step5_case("Case 6 (Wrong Channel)", 5U, tx_str, "TIMEOUT", obs, step_pass);
+
+        if (step_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 6 Wrong Channel: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 6 Wrong Channel: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Case 7: Recovery after Wrong Channel (seq = 6 on ch 0)
+     * ----------------------------------------------------------------- */
+    {
+        uint8_t tx_buf[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        fhss_frame_t ack;
+        step5_ack_detail_t detail;
+        char obs[40];
+
+        delay_ms(50U);
+        air_mock_flush();
+        fhss_build_hop(6U, 0U, 0U, tx_buf, &tx_len);
+
+        int tx_res = air_tx(0U, tx_buf, tx_len);
+        const char *tx_str = (tx_res == (int)OK) ? "OK" : "FAIL";
+
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int step_pass = (detail.status == ACK_STAT_OK) && (tx_res == (int)OK);
+        log_step5_case("Case 7 (Recovery)", 6U, tx_str, "ACK", obs, step_pass);
+
+        if (step_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 7 Recovery: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 7 Recovery: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Case 8: ACK Suppression and Recovery (seq = 7 suppressed, seq = 8 OK)
+     * ----------------------------------------------------------------- */
+    {
+        uint8_t tx_buf[MAX_FRAME_LEN];
+        uint8_t tx_len = 0U;
+        fhss_frame_t ack;
+        step5_ack_detail_t detail;
+        char obs[40];
+        int c8_pass = 1;
+
+        /* 1st copy (seq 7, designated suppression frame): expect TIMEOUT */
+        delay_ms(50U);
+        air_mock_flush();
+        fhss_build_hop(7U, 0U, 0U, tx_buf, &tx_len);
+        int tx_res1 = air_tx(0U, tx_buf, tx_len);
+        const char *tx_str1 = (tx_res1 == (int)OK) ? "OK" : "FAIL";
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int pass1 = (detail.status == ACK_STAT_TIMEOUT) && (tx_res1 == (int)OK);
+        if (!pass1) { c8_pass = 0; }
+        log_step5_case("Case 8 (ACK Suppress)", 7U, tx_str1, "TIMEOUT", obs, pass1);
+
+        /* 2nd copy (seq 8, recovery frame): expect valid ACK */
+        delay_ms(50U);
+        air_mock_flush();
+        fhss_build_hop(8U, 0U, 0U, tx_buf, &tx_len);
+        int tx_res2 = air_tx(0U, tx_buf, tx_len);
+        const char *tx_str2 = (tx_res2 == (int)OK) ? "OK" : "FAIL";
+        step5_wait_ack(0U, STEP5_ACK_TIMEOUT_MS, &s_rx_replay, &ack, &detail);
+        format_obs(&detail, obs);
+        int pass2 = (detail.status == ACK_STAT_OK) && (tx_res2 == (int)OK);
+        if (!pass2) { c8_pass = 0; }
+        log_step5_case("Case 8 (Recovery)", 8U, tx_str2, "ACK", obs, pass2);
+
+        if (c8_pass) {
+            passed_cases++;
+            log_line(TAG_TEST, "Case 8 ACK Suppression & Recovery: PASS");
+        } else {
+            log_line(TAG_TEST, "Case 8 ACK Suppression & Recovery: FAIL");
+        }
+    }
+
+    /* -----------------------------------------------------------------
+     * Final One-Shot Summary and Idle State
+     * ----------------------------------------------------------------- */
+    char sum_buf[64];
+    char num[12];
+    char *p = sum_buf;
+    const char *s = "Stage 5 Summary: "; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii(passed_cases, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p++ = '/';
+    uint32_to_ascii(total_cases, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " cases PASS"; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_TEST, sum_buf);
+
+    if (passed_cases == total_cases) {
+        log_line(TAG_TEST, "Stage 5 Fault Test Complete: ALL PASS (one-shot)");
+    } else {
+        log_line(TAG_TEST, "Stage 5 Fault Test Complete: FAIL (one-shot)");
+    }
+
+    /* Idle forever; do NOT restart at sequence 254 */
+    log_line(TAG_BOOT, "Stage 5 idle; reset board to rerun");
+    uint32_t idle_sec = 0;
+    while (1) {
+        delay_ms(5000U);
+        idle_sec += 5U;
+        char idle_buf[48];
+        char num_idle[12];
+        char *ip = idle_buf;
+        const char *m = "idle ("; while (*m != '\0') *ip++ = *m++;
+        uint32_to_ascii(idle_sec, num_idle); const char *sn = num_idle; while (*sn != '\0') *ip++ = *sn++;
+        m = "s); press RESET to rerun"; while (*m != '\0') *ip++ = *m++;
+        *ip = '\0';
+        log_line(TAG_BOOT, idle_buf);
+    }
+}
+#endif
+
 /*
  * Node A (Transmitter and Hop Master)
  * Step A2: SPI1 Master Mode 0, RegVersion check, retry logic, and safe halt.
@@ -915,7 +1483,9 @@ static void step4_radio_spi_diag_run(void) {
 int main(void) {
     baremetal_init();
 
-#if defined(STEP4_RADIO_SPI_DIAG)
+#if defined(STEP5_FAULT_TEST)
+    step5_fault_test_run();
+#elif defined(STEP4_RADIO_SPI_DIAG)
     step4_radio_spi_diag_run();
 #elif defined(STEP3_FHSS_MOCK)
     step3_fhss_mock_run();

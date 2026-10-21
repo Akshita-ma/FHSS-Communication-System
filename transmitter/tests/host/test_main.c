@@ -935,5 +935,271 @@ int main(void) {
 
     printf("[HOST TEST] Stage 4 SX1278 SPI diagnostic tests PASS\n");
 
+    /* =====================================================================
+     * Stage 5: Fault-Injection and Reliability Test Harness host verification
+     * ===================================================================== */
+    printf("[HOST TEST] Running Stage 5 fault-injection and reliability harness tests...\n");
+
+    /* 1. Verify delimiter absence: NO byte in ANY Stage 5 frame body or envelope is 0x7E */
+    static const uint8_t s_stage5_seqs[11] = {
+        254U, 255U, 0U, 1U, /* Case 1 */
+        2U,                 /* Case 2 */
+        3U,                 /* Case 3 & 4 */
+        4U,                 /* Case 5 */
+        5U,                 /* Case 6 */
+        6U,                 /* Case 7 */
+        7U, 8U              /* Case 8 */
+    };
+
+    for (size_t i = 0; i < 11; i++) {
+        uint8_t seq = s_stage5_seqs[i];
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_hop(seq, 0U, 0U, f_buf, &f_len) == OK);
+        assert(f_len == HEADER_LEN);
+
+        /* Verify frame body has no 0x7E delimiter */
+        for (uint8_t j = 0; j < f_len; j++) {
+            assert(f_buf[j] != MOCK_WIRE_DELIMITER);
+        }
+
+        /* Verify wire envelope on channel 0 has no 0x7E in CRC */
+        uint8_t env_crc_ch0 = fhss_crc8_update(fhss_crc8((const uint8_t[]){0x00U, f_len}, 2U), f_buf, f_len);
+        assert(env_crc_ch0 != MOCK_WIRE_DELIMITER);
+
+        /* For Case 6 (seq 5), also verify envelope on channel 1 */
+        if (seq == 5U) {
+            uint8_t env_crc_ch1 = fhss_crc8_update(fhss_crc8((const uint8_t[]){0x01U, f_len}, 2U), f_buf, f_len);
+            assert(env_crc_ch1 != MOCK_WIRE_DELIMITER);
+        }
+    }
+
+    /* 2. Verify Case 1 wraparound arithmetic and parsing on receiver replay */
+    {
+        fhss_replay_t rx_replay = {0, 0};
+        static const uint8_t wrap_seqs[4] = {254U, 255U, 0U, 1U};
+
+        for (int i = 0; i < 4; i++) {
+            uint8_t seq = wrap_seqs[i];
+            uint8_t f_buf[MAX_FRAME_LEN];
+            uint8_t f_len = 0U;
+            assert(fhss_build_hop(seq, 0U, 0U, f_buf, &f_len) == OK);
+
+            fhss_frame_t parsed;
+            status_t status = fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed);
+            assert(status == OK);
+            assert(parsed.seq == seq);
+            assert(parsed.type == PKT_TYPE_HOP);
+            assert(rx_replay.last_seq == seq);
+            assert(rx_replay.have_last == 1U);
+        }
+    }
+
+    /* 3. Verify Case 2: Bad envelope CRC rejection */
+    {
+        mock_ring_t r;
+        mock_ring_init(&r);
+
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_hop(2U, 0U, 0U, f_buf, &f_len) == OK);
+
+        /* Build envelope with corrupted CRC */
+        uint8_t env[MAX_FRAME_LEN + 4U];
+        env[0] = MOCK_WIRE_DELIMITER;
+        env[1] = 0x00U;
+        env[2] = f_len;
+        memcpy(&env[3], f_buf, f_len);
+        uint8_t good_crc = fhss_crc8(&env[1], (uint8_t)(f_len + 2U));
+        env[3U + f_len] = good_crc ^ 0xA5U;
+        uint8_t env_len = (uint8_t)(f_len + 4U);
+
+        for (uint8_t i = 0; i < env_len; i++) {
+            mock_ring_push(&r, env[i]);
+        }
+
+        uint8_t out_buf[MAX_FRAME_LEN];
+        uint8_t out_len = 0U;
+        int poll_res = mock_ring_poll(&r, 0U, out_buf, &out_len);
+        assert(poll_res == (int)ERR_TIMEOUT); /* Wire parser drops corrupted CRC */
+    }
+
+    /* 4. Verify Case 3: Bad protocol tag rejection */
+    {
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_hop(3U, 0U, 0U, f_buf, &f_len) == OK);
+        f_buf[5] ^= 0xFFU; /* Invert integrity tag */
+
+        fhss_replay_t rx_replay = {1U, 1U}; /* last_seq = 1 */
+        fhss_frame_t parsed;
+        status_t status = fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed);
+        assert(status == ERR_TAG);
+        assert(rx_replay.last_seq == 1U); /* Replay state must not advance on ERR_TAG */
+    }
+
+    /* 5. Verify Case 4: Recovery after bad tag */
+    {
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_hop(3U, 0U, 0U, f_buf, &f_len) == OK);
+
+        fhss_replay_t rx_replay = {1U, 1U}; /* last_seq = 1 */
+        fhss_frame_t parsed;
+        status_t status = fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed);
+        assert(status == OK);
+        assert(parsed.seq == 3U);
+        assert(rx_replay.last_seq == 3U);
+    }
+
+    /* 6. Verify Case 5: Duplicate frame replay rejection */
+    {
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_hop(4U, 0U, 0U, f_buf, &f_len) == OK);
+
+        fhss_replay_t rx_replay = {3U, 1U}; /* last_seq = 3 */
+        fhss_frame_t parsed;
+
+        /* First copy: accepted */
+        status_t status1 = fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed);
+        assert(status1 == OK);
+        assert(rx_replay.last_seq == 4U);
+
+        /* Second copy: rejected with ERR_REPLAY */
+        status_t status2 = fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed);
+        assert(status2 == ERR_REPLAY);
+        assert(rx_replay.last_seq == 4U);
+    }
+
+    /* 7. Verify Case 6: Wrong envelope channel filtering */
+    {
+        mock_ring_t r;
+        mock_ring_init(&r);
+
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_hop(5U, 0U, 0U, f_buf, &f_len) == OK);
+
+        /* Build valid envelope on channel 1 */
+        uint8_t env[MAX_FRAME_LEN + 4U];
+        env[0] = MOCK_WIRE_DELIMITER;
+        env[1] = 0x01U; /* channel 1 */
+        env[2] = f_len;
+        memcpy(&env[3], f_buf, f_len);
+        env[3U + f_len] = fhss_crc8(&env[1], (uint8_t)(f_len + 2U));
+        uint8_t env_len = (uint8_t)(f_len + 4U);
+
+        for (uint8_t i = 0; i < env_len; i++) {
+            mock_ring_push(&r, env[i]);
+        }
+
+        uint8_t out_buf[MAX_FRAME_LEN];
+        uint8_t out_len = 0U;
+        /* Receiver tuned to channel 0 drops channel 1 */
+        int poll_res = mock_ring_poll(&r, 0U, out_buf, &out_len);
+        assert(poll_res == (int)ERR_TIMEOUT);
+    }
+
+    /* 8. Verify Case 7: Recovery after wrong channel */
+    {
+        uint8_t f_buf[MAX_FRAME_LEN];
+        uint8_t f_len = 0U;
+        assert(fhss_build_hop(6U, 0U, 0U, f_buf, &f_len) == OK);
+
+        fhss_replay_t rx_replay = {4U, 1U}; /* last_seq = 4 from Case 5 */
+        fhss_frame_t parsed;
+        status_t status = fhss_parse_frame(f_buf, f_len, DIR_A_TO_B, &rx_replay, &parsed);
+        assert(status == OK);
+        assert(parsed.seq == 6U);
+        assert(rx_replay.last_seq == 6U);
+    }
+
+    /* 9. Verify Case 8: ACK suppression and recovery sequence arithmetic */
+    {
+        fhss_replay_t rx_replay = {6U, 1U}; /* last_seq = 6 */
+
+        /* Packet 7 (suppressed): receiver validates and advances replay */
+        uint8_t f_buf7[MAX_FRAME_LEN];
+        uint8_t f_len7 = 0U;
+        assert(fhss_build_hop(7U, 0U, 0U, f_buf7, &f_len7) == OK);
+        fhss_frame_t parsed7;
+        assert(fhss_parse_frame(f_buf7, f_len7, DIR_A_TO_B, &rx_replay, &parsed7) == OK);
+        assert(rx_replay.last_seq == 7U);
+        /* Node B intentionally does not transmit ACK; Node A times out */
+
+        /* Packet 8 (recovery): receiver validates and advances replay */
+        uint8_t f_buf8[MAX_FRAME_LEN];
+        uint8_t f_len8 = 0U;
+        assert(fhss_build_hop(8U, 0U, 0U, f_buf8, &f_len8) == OK);
+        fhss_frame_t parsed8;
+        assert(fhss_parse_frame(f_buf8, f_len8, DIR_A_TO_B, &rx_replay, &parsed8) == OK);
+        assert(rx_replay.last_seq == 8U);
+
+        /* Node B sends ACK (seq 8); Node A receives and parses ACK */
+        uint8_t ack_wire[MAX_FRAME_LEN];
+        uint8_t ack_wire_len = 0U;
+        assert(fhss_build_ack(8U, 0U, 1U, 0x01U, 0x78U, 0U, 0U, ack_wire, &ack_wire_len) == OK);
+
+        fhss_replay_t a_rx_replay = {6U, 1U}; /* Node A last received ACK was for seq 6 */
+        fhss_frame_t a_parsed_ack;
+        assert(fhss_parse_frame(ack_wire, ack_wire_len, DIR_B_TO_A, &a_rx_replay, &a_parsed_ack) == OK);
+        assert(a_parsed_ack.type == PKT_TYPE_ACK);
+        assert(a_parsed_ack.seq == 8U);
+        assert(a_rx_replay.last_seq == 8U);
+    }
+
+    /* 10. Verify Node A ACK rejection on corrupted integrity tag or wrong type */
+    {
+        uint8_t ack_wire[MAX_FRAME_LEN];
+        uint8_t ack_wire_len = 0U;
+        assert(fhss_build_ack(9U, 0U, 1U, 0x01U, 0x78U, 0U, 0U, ack_wire, &ack_wire_len) == OK);
+        ack_wire[5] ^= 0x55U; /* Corrupt tag */
+
+        fhss_replay_t a_rx_replay = {8U, 1U};
+        fhss_frame_t a_parsed_ack;
+        assert(fhss_parse_frame(ack_wire, ack_wire_len, DIR_B_TO_A, &a_rx_replay, &a_parsed_ack) == ERR_TAG);
+        assert(a_rx_replay.last_seq == 8U);
+    }
+
+    /* 11. Verify documented ACK sequence semantics: ACK sequence is per-sender counter, NOT echoed TX sequence */
+    {
+        /* Suppose Node B maintains its own sequence counter: 0, 1, 2, ... */
+        fhss_replay_t a_rx_replay = {0, 0};
+
+        /* Node B transmits ACKs with independent sequence numbers */
+        for (uint8_t b_seq = 0; b_seq < 5U; b_seq++) {
+            uint8_t ack_buf[MAX_FRAME_LEN];
+            uint8_t ack_len = 0U;
+            assert(fhss_build_ack(b_seq, 0U, 1U, 0x01U, 0x78U, 0U, 0U, ack_buf, &ack_len) == OK);
+
+            fhss_frame_t parsed_ack;
+            status_t status = fhss_parse_frame(ack_buf, ack_len, DIR_B_TO_A, &a_rx_replay, &parsed_ack);
+            assert(status == OK);
+            assert(parsed_ack.type == PKT_TYPE_ACK);
+            assert(parsed_ack.seq == b_seq);
+            assert(a_rx_replay.last_seq == b_seq);
+        }
+    }
+
+    /* 12. Verify root-cause reproduction: repeating cycle from seq 254 when Node B is at last_seq=8 triggers ERR_REPLAY */
+    {
+        fhss_replay_t b_replay_after_cycle1 = {8U, 1U}; /* Node B after completing cycle 1 */
+
+        uint8_t f_buf254[MAX_FRAME_LEN];
+        uint8_t f_len254 = 0U;
+        assert(fhss_build_hop(254U, 0U, 0U, f_buf254, &f_len254) == OK);
+
+        fhss_frame_t parsed;
+        status_t status = fhss_parse_frame(f_buf254, f_len254, DIR_A_TO_B, &b_replay_after_cycle1, &parsed);
+        /* (uint8_t)(254 - 8) = 246 > 127 -> ERR_REPLAY */
+        assert(status == ERR_REPLAY);
+        assert(b_replay_after_cycle1.last_seq == 8U);
+    }
+
+    printf("[HOST TEST] Stage 5 fault-injection and reliability harness tests PASS\n");
+
     return 0;
 }
+
+

@@ -44,7 +44,7 @@ HOST_TEST_SRCS = tests/host/test_main.c \
                  ../common/fhss_protocol.c
 HOST_TEST_BIN  = $(BUILD_DIR)/host_tests
 
-.PHONY: all clean flash test dump_vector selftest_loopback selftest_pins demo step1_test step1 step2_mock step2 step3_fhss_mock step3 step4_radio_spi_diag step4
+.PHONY: all clean flash test dump_vector selftest_loopback selftest_pins demo step1_test step1 step2_mock step2 step3_fhss_mock step3 step4_radio_spi_diag step4 step5_fault_test step5
 
 ifeq ($(RF_KEYING),1)
 DEMO_EXTRA = -DDEMO_RF_KEYING
@@ -77,6 +77,12 @@ step4_radio_spi_diag:
 	$(MAKE) all EXTRA_CFLAGS="-DSTEP4_RADIO_SPI_DIAG"
 
 step4: step4_radio_spi_diag
+
+step5_fault_test:
+	$(MAKE) clean
+	$(MAKE) all EXTRA_CFLAGS="-DDEMO_USART_LINK -DSTEP5_FAULT_TEST"
+
+step5: step5_fault_test
 
 demo:
 	$(MAKE) clean
