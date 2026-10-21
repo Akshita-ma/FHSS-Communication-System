@@ -4,8 +4,9 @@
 #include "common/status.h"
 #include "common/fhss_protocol.h"
 #include "stm32f1_regs.h"
+#include "air_mock.h"
 
-#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST)
+#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK)
 
 /*
  * USART2 Mock Air Link for Node A (STM32F103)
@@ -14,6 +15,27 @@
  */
 
 #define WIRE_DELIMITER 0x7EU
+
+/* Diagnostic counters for Stage 3.1 analysis */
+static air_mock_diag_t s_mock_diag = {0U, 0U, 0U, 0U, 0U};
+
+void air_mock_get_diag(air_mock_diag_t *diag) {
+    if (diag != (air_mock_diag_t *)0) {
+        diag->channel_mismatch_count = s_mock_diag.channel_mismatch_count;
+        diag->crc_error_count = s_mock_diag.crc_error_count;
+        diag->last_mismatch_wire_ch = s_mock_diag.last_mismatch_wire_ch;
+        diag->last_mismatch_tuned_ch = s_mock_diag.last_mismatch_tuned_ch;
+        diag->last_mismatch_len = s_mock_diag.last_mismatch_len;
+    }
+}
+
+void air_mock_clear_diag(void) {
+    s_mock_diag.channel_mismatch_count = 0U;
+    s_mock_diag.crc_error_count = 0U;
+    s_mock_diag.last_mismatch_wire_ch = 0U;
+    s_mock_diag.last_mismatch_tuned_ch = 0U;
+    s_mock_diag.last_mismatch_len = 0U;
+}
 
 /* Ring buffer for USART2 RX */
 static volatile uint8_t  s_rx_ring[256];
@@ -43,9 +65,10 @@ void USART2_IRQHandler(void) {
  * Initialize USART2 on PA2 (TX) and PA3 (RX) for Node A (F103)
  */
 void air_mock_init(void) {
-    /* Initialize ring buffer pointers */
+    /* Initialize ring buffer pointers and diagnostic counters */
     s_rx_head = 0U;
     s_rx_tail = 0U;
+    air_mock_clear_diag();
 
     /* Enable USART2 clock in RCC->APB1ENR bit 17 */
     RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
@@ -281,7 +304,8 @@ int air_rx_poll(uint8_t ch, uint8_t *buf, uint8_t *len) {
         uint8_t wire_crc = temp[wire_total - 1U];
 
         if (calc_crc != wire_crc) {
-            /* Corrupted wire packet; skip and look for next */
+            /* Corrupted wire packet; record diagnostic and skip */
+            s_mock_diag.crc_error_count++;
             continue;
         }
 
@@ -289,7 +313,11 @@ int air_rx_poll(uint8_t ch, uint8_t *buf, uint8_t *len) {
          * Receiver only hears sender if sender's channel equals receiver's current channel
          */
         if (wire_ch != ch) {
-            /* Different channel, not heard */
+            /* Different channel, not heard; record mismatch diagnostic */
+            s_mock_diag.channel_mismatch_count++;
+            s_mock_diag.last_mismatch_wire_ch = wire_ch;
+            s_mock_diag.last_mismatch_tuned_ch = ch;
+            s_mock_diag.last_mismatch_len = wire_len;
             continue;
         }
 
@@ -368,5 +396,5 @@ uint8_t air_rssi_raw(uint8_t ch) {
 
 #endif /* DEMO_USART_LINK */
 
-#endif /* DEMO_USART_LINK || STEP1_UART_TEST || STEP2_MOCK_TEST */
+#endif /* DEMO_USART_LINK || STEP1_UART_TEST || STEP2_MOCK_TEST || STEP3_FHSS_MOCK */
 

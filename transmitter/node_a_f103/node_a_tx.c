@@ -47,6 +47,7 @@ static void uint8_to_hex(uint8_t val, char *buf) {
     buf[4] = '\0';
 }
 
+#if !defined(STEP4_RADIO_SPI_DIAG)
 /*
  * Print "[BOOT] node=A hello n\r\n"
  */
@@ -62,8 +63,9 @@ static void print_boot_hello(uint32_t n) {
 }
 #endif
 #endif
+#endif
 
-#ifdef SELFTEST_SPI_LOOPBACK
+#if defined(SELFTEST_SPI_LOOPBACK) || defined(STEP4_RADIO_SPI_DIAG)
 /*
  * Convert 16-bit value to 6-digit hex string "0x...."
  */
@@ -77,7 +79,9 @@ static void uint16_to_hex(uint16_t val, char *buf) {
     buf[5] = hex_digits[val & 0x0FU];
     buf[6] = '\0';
 }
+#endif
 
+#ifdef SELFTEST_SPI_LOOPBACK
 /*
  * SELFTEST_SPI_LOOPBACK:
  * With the radio disconnected and PA7 (MOSI) jumpered to PA6 (MISO),
@@ -221,14 +225,13 @@ static void selftest_pins_run(void) {
 }
 #endif
 
-#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST)
+#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK)
 #include "common/air.h"
 #include "common/fhss_protocol.h"
+#include "air_mock.h"
 #endif
 
-#if defined(DEMO_USART_LINK) && !defined(STEP2_MOCK_TEST)
-
-void mock_air_notify_locked(void);
+#if (defined(DEMO_USART_LINK) || defined(STEP3_FHSS_MOCK)) && !defined(STEP2_MOCK_TEST)
 
 static void log_sync_locked(uint8_t ch, uint32_t delta) {
     char buf[48];
@@ -278,6 +281,107 @@ static void log_hop(uint32_t k, uint8_t ch, uint32_t delta) {
     log_line(TAG_HOP, buf);
 }
 
+static void log_rx_ack(uint8_t ch, uint8_t seq, uint8_t rssi_raw) {
+    char buf[48];
+    char num[12];
+    char *p = buf;
+
+    const char *s = "ACK ch="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " seq="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)seq, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " rssi="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)rssi_raw, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_RX, buf);
+}
+
+static void log_rx_reject_channel(uint8_t wire_ch, uint8_t expected_ch, uint8_t missed) {
+    char buf[64];
+    char num[12];
+    char *p = buf;
+
+    const char *s = "REJECT wire_ch="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)wire_ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " expected="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)expected_ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " missed="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)missed, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_RX, buf);
+}
+
+static void log_rx_reject_crc(uint8_t ch, uint8_t missed) {
+    char buf[48];
+    char num[12];
+    char *p = buf;
+
+    const char *s = "REJECT CRC ch="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " missed="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)missed, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_RX, buf);
+}
+
+static void log_rx_reject_replay(uint8_t seq, uint8_t last_seq, uint8_t ch, uint8_t missed) {
+    char buf[64];
+    char num[12];
+    char *p = buf;
+
+    const char *s = "REJECT REPLAY seq="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)seq, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " last="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)last_seq, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " ch="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " missed="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)missed, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_RX, buf);
+}
+
+static void log_rx_reject_tag(uint8_t ch, uint8_t missed) {
+    char buf[48];
+    char num[12];
+    char *p = buf;
+
+    const char *s = "REJECT TAG ch="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " missed="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)missed, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_RX, buf);
+}
+
+static void log_rx_reject_type(uint8_t type, uint8_t ch, uint8_t missed) {
+    char buf[64];
+    char num[12];
+    char *p = buf;
+
+    const char *s = "REJECT type="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)type, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " expected=ACK ch="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " missed="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)missed, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_RX, buf);
+}
+
+static void log_rx_timeout(uint8_t ch, uint8_t missed) {
+    char buf[48];
+    char num[12];
+    char *p = buf;
+
+    const char *s = "TIMEOUT ch="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)ch, num); s = num; while (*s != '\0') *p++ = *s++;
+    s = " missed="; while (*s != '\0') *p++ = *s++;
+    uint32_to_ascii((uint32_t)missed, num); s = num; while (*s != '\0') *p++ = *s++;
+    *p = '\0';
+    log_line(TAG_RX, buf);
+}
+
 /* Local PRNG for channel and dwell selection */
 static uint32_t s_node_a_prng = 0x83A14B2CUL;
 
@@ -305,10 +409,17 @@ static void hop_callback(void) {
 }
 
 static void node_a_demo_run(void) {
+#ifdef STEP3_FHSS_MOCK
+    log_line(TAG_BOOT, "node=A test=STAGE3_FHSS_MOCK link=USART2 mock_rf=simulated");
+    log_line(TAG_BOOT, "RF bypassed: SX1278 uninitialized; UART wire does not physically hop RF channels");
+#else
     log_line(TAG_BOOT, "node=A link=USART2");
+#endif
 #ifdef DEMO_TRACE
     log_line(TAG_BOOT, "trace PB1=hop PB10=tx PB12=ack PB13..15=ch PA8=jam PB5=locked");
 #endif
+
+    air_mock_flush();
 
     if (fhss_verify_vectors() == OK) {
         log_line(TAG_TEST, "vectors PASS");
@@ -338,6 +449,7 @@ static void node_a_demo_run(void) {
             /* PB13..PB15 set to channel 0 */
             GPIOB->BSRR = (1UL << (13 + 16)) | (1UL << (14 + 16)) | (1UL << (15 + 16));
 #endif
+            air_mock_flush();
             s_current_ch = 0U;
             s_replay.have_last = 0U;
             log_line(TAG_SYNC, "SEARCH ch=0");
@@ -385,6 +497,8 @@ static void node_a_demo_run(void) {
                             s_hop_k = 0U;
                             s_missed_hops = 0U;
                             s_hop_event = 0U;
+                            uint8_t ack_rssi = (parsed.payload_len >= 2U) ? parsed.payload[1] : 0U;
+                            log_rx_ack(0U, parsed.seq, ack_rssi);
                             log_sync_locked(0U, HOME_DWELL_MS);
 
                             /* First ACK anchors the home hop */
@@ -444,18 +558,30 @@ static void node_a_demo_run(void) {
                     fhss_build_hop(s_tx_seq++, s_next_ch, s_next_dwell_code, tx_buf, &tx_len);
                     air_tx(s_current_ch, tx_buf, tx_len);
 
+                    /* Clear diagnostic counters before waiting for ACK */
+                    air_mock_clear_diag();
+
                     /* Wait up to ACK_TIMEOUT_MS for ACK */
                     uint32_t t_ack_start = millis();
                     int ack_rcvd = 0;
+                    status_t last_parse_err = OK;
+                    uint8_t last_bad_type = 0U;
+                    uint8_t last_rej_seq = 0U;
+                    uint8_t ack_seq = 0U;
+                    uint8_t ack_rssi = 0U;
+
                     while ((millis() - t_ack_start) < ACK_TIMEOUT_MS) {
                         TIM2_Poll();
                         uint8_t rx_buf[MAX_FRAME_LEN];
                         uint8_t rx_len = 0U;
                         if (air_rx_poll(s_current_ch, rx_buf, &rx_len) == OK) {
                             fhss_frame_t parsed;
-                            if (fhss_parse_frame(rx_buf, rx_len, DIR_B_TO_A, &s_replay, &parsed) == OK) {
+                            status_t parse_res = fhss_parse_frame(rx_buf, rx_len, DIR_B_TO_A, &s_replay, &parsed);
+                            if (parse_res == OK) {
                                 if (parsed.type == PKT_TYPE_ACK) {
                                     ack_rcvd = 1;
+                                    ack_seq = parsed.seq;
+                                    ack_rssi = (parsed.payload_len >= 2U) ? parsed.payload[1] : 0U;
 #ifdef DEMO_TRACE
                                     GPIOB->BSRR = (1UL << 12);
                                     uint32_t tp = micros();
@@ -463,6 +589,13 @@ static void node_a_demo_run(void) {
                                     GPIOB->BRR = (1UL << 12);
 #endif
                                     break;
+                                } else {
+                                    last_bad_type = parsed.type;
+                                }
+                            } else {
+                                last_parse_err = parse_res;
+                                if (rx_len >= 2U) {
+                                    last_rej_seq = rx_buf[1];
                                 }
                             }
                         }
@@ -470,8 +603,26 @@ static void node_a_demo_run(void) {
 
                     if (ack_rcvd != 0) {
                         s_missed_hops = 0U;
+                        log_rx_ack(s_current_ch, ack_seq, ack_rssi);
                     } else {
                         s_missed_hops++;
+                        air_mock_diag_t diag;
+                        air_mock_get_diag(&diag);
+
+                        if (last_parse_err == ERR_REPLAY) {
+                            log_rx_reject_replay(last_rej_seq, s_replay.last_seq, s_current_ch, s_missed_hops);
+                        } else if (last_parse_err == ERR_TAG) {
+                            log_rx_reject_tag(s_current_ch, s_missed_hops);
+                        } else if (last_bad_type != 0U) {
+                            log_rx_reject_type(last_bad_type, s_current_ch, s_missed_hops);
+                        } else if (diag.channel_mismatch_count > 0U) {
+                            log_rx_reject_channel(diag.last_mismatch_wire_ch, s_current_ch, s_missed_hops);
+                        } else if (diag.crc_error_count > 0U) {
+                            log_rx_reject_crc(s_current_ch, s_missed_hops);
+                        } else {
+                            log_rx_timeout(s_current_ch, s_missed_hops);
+                        }
+
                         if (s_missed_hops >= SYNC_MAX_MISSED_HOPS) {
                             log_line(TAG_SYNC, "LOST");
                             state = STATE_SEARCH;
@@ -609,6 +760,154 @@ static void step2_mock_run(void) {
 }
 #endif
 
+#ifdef STEP3_FHSS_MOCK
+static void step3_fhss_mock_run(void) {
+    node_a_demo_run();
+}
+#endif
+
+#ifdef STEP4_RADIO_SPI_DIAG
+/*
+ * Stage 4 SX1278 SPI Diagnostic for Node A (STM32F103)
+ * Read-only register diagnosis:
+ * - Logs established SPI1 configuration and pin mapping
+ * - Performs hardware reset sequence via PA1
+ * - Samples MISO (PA6) under idle and active NSS states
+ * - Performs 32 consecutive reads of RegVersion (0x42)
+ * - Reports individual reads, valid/fail counts, first unexpected value, and diagnostic inference
+ * - NEVER enters TX/RX mode, transmits packets, or writes arbitrary registers
+ */
+static void step4_radio_spi_diag_run(void) {
+    log_line(TAG_BOOT, "node=A test=STEP4_RADIO_SPI_DIAG mode=read-only");
+
+    /* 1. Log SPI settings and GPIO assumptions established from source and registers */
+    uint16_t cr1 = (uint16_t)SPI1->CR1;
+    uint16_t sr  = (uint16_t)SPI1->SR;
+    char hex_cr1[7], hex_sr[7];
+    uint16_to_hex(cr1, hex_cr1);
+    uint16_to_hex(sr, hex_sr);
+
+    char reg_buf[64];
+    char *p = reg_buf;
+    const char *s_cr1 = "SPI1 CR1="; while (*s_cr1 != '\0') *p++ = *s_cr1++;
+    for (int i = 0; i < 6; i++) *p++ = hex_cr1[i];
+    const char *s_sr = " SR="; while (*s_sr != '\0') *p++ = *s_sr++;
+    for (int i = 0; i < 6; i++) *p++ = hex_sr[i];
+    *p = '\0';
+    log_line(TAG_RADIO, reg_buf);
+
+    log_line(TAG_RADIO, "Config: Mode=0 (CPOL=0, CPHA=0), MSB-first, 8-bit, Master, SSM=1, SSI=1");
+    log_line(TAG_RADIO, "Clock: APB2=8MHz, Prescaler=/8 -> f_sck=1.0MHz (SX1278 max is 10MHz)");
+    log_line(TAG_RADIO, "Pins: PA5=SCK(AF_PP) PA7=MOSI(AF_PP) PA6=MISO(IN_PULLUP) PB0=NSS(GP_PP) PA1=RESET(GP_PP)");
+
+    /* Sample MISO line idle level with NSS HIGH (pull-up should read 1) */
+    uint8_t miso_idle = (uint8_t)((GPIOA->IDR & (1UL << 6)) ? 1U : 0U);
+    if (miso_idle != 0U) {
+        log_line(TAG_RADIO, "Observed: MISO idle (NSS=HIGH) is HIGH (internal pull-up OK)");
+    } else {
+        log_line(TAG_RADIO, "Observed: MISO idle (NSS=HIGH) is LOW (WARNING: MISO held low externally)");
+    }
+
+    /* 2. Execute SX1278 hardware reset procedure (PA1 LOW 2ms, wait 20ms) */
+    log_line(TAG_RADIO, "Executing SX1278 hardware reset sequence (PA1)...");
+    sx1278_reset();
+    log_line(TAG_RADIO, "Reset sequence complete (PA1 LOW 2ms, settled 20ms)");
+
+    /* Sample MISO level with NSS asserted LOW prior to clocking */
+    NSS_LOW();
+    uint8_t miso_active = (uint8_t)((GPIOA->IDR & (1UL << 6)) ? 1U : 0U);
+    NSS_HIGH();
+    if (miso_active != 0U) {
+        log_line(TAG_RADIO, "Observed: MISO selected (NSS=LOW, no clock) is HIGH");
+    } else {
+        log_line(TAG_RADIO, "Observed: MISO selected (NSS=LOW, no clock) is LOW");
+    }
+
+    /* 3. Diagnostic loop: perform 32 consecutive reads of RegVersion (0x42) */
+    while (1) {
+        uint8_t reads[32];
+        uint32_t valid_count = 0U;
+        uint32_t fail_count = 0U;
+        uint8_t first_unexpected = 0U;
+        int have_unexpected = 0;
+
+        for (uint32_t i = 0; i < 32U; i++) {
+            reads[i] = sx1278_read_reg(REG_VERSION);
+            if (reads[i] == SX1278_EXPECTED_VERSION) {
+                valid_count++;
+            } else {
+                fail_count++;
+                if (have_unexpected == 0) {
+                    first_unexpected = reads[i];
+                    have_unexpected = 1;
+                }
+            }
+            delay_ms(5U);
+        }
+
+        /* Report individual read values in 4 lines of 8 */
+        for (uint32_t block = 0; block < 4U; block++) {
+            char line_buf[64];
+            char *lp = line_buf;
+            const char *blk_pfx = "reads ["; while (*blk_pfx != '\0') *lp++ = *blk_pfx++;
+            char nbuf[12];
+            uint32_to_ascii(block * 8U, nbuf);
+            if (block * 8U < 10U) *lp++ = '0';
+            const char *s = nbuf; while (*s != '\0') *lp++ = *s++;
+            const char *mid = ".."; while (*mid != '\0') *lp++ = *mid++;
+            uint32_to_ascii(block * 8U + 7U, nbuf);
+            if (block * 8U + 7U < 10U) *lp++ = '0';
+            s = nbuf; while (*s != '\0') *lp++ = *s++;
+            const char *blk_sfx = "]: "; while (*blk_sfx != '\0') *lp++ = *blk_sfx++;
+
+            for (uint32_t j = 0; j < 8U; j++) {
+                char hbuf[5];
+                uint8_to_hex(reads[block * 8U + j], hbuf);
+                for (int k = 0; k < 4; k++) *lp++ = hbuf[k];
+                if (j < 7U) *lp++ = ' ';
+            }
+            *lp = '\0';
+            log_line(TAG_RADIO, line_buf);
+        }
+
+        /* Report summary */
+        char summary_buf[96];
+        char *sp = summary_buf;
+        const char *s1 = "RegVersion summary: total=32 valid="; while (*s1 != '\0') *sp++ = *s1++;
+        char num[12];
+        uint32_to_ascii(valid_count, num); const char *sn = num; while (*sn != '\0') *sp++ = *sn++;
+        const char *s2 = " fail="; while (*s2 != '\0') *sp++ = *s2++;
+        uint32_to_ascii(fail_count, num); sn = num; while (*sn != '\0') *sp++ = *sn++;
+        const char *s3 = " first_unexp="; while (*s3 != '\0') *sp++ = *s3++;
+        if (have_unexpected != 0) {
+            char hbuf[5];
+            uint8_to_hex(first_unexpected, hbuf);
+            for (int k = 0; k < 4; k++) *sp++ = hbuf[k];
+        } else {
+            const char *none_s = "none"; while (*none_s != '\0') *sp++ = *none_s++;
+        }
+        const char *s4 = " expected=0x12"; while (*s4 != '\0') *sp++ = *s4++;
+        *sp = '\0';
+        log_line(TAG_TEST, summary_buf);
+
+        /* Diagnostic classification */
+        if (valid_count == 32U) {
+            log_line(TAG_TEST, "Classification: PASS (SX1278 silicon ID 0x12 stable across 32 reads)");
+        } else if (valid_count == 0U && first_unexpected == 0x00U) {
+            log_line(TAG_TEST, "Classification: FAIL_MISO_STUCK_LOW (all reads 0x00; check MISO wiring, 3.3V VCC, or GND)");
+        } else if (valid_count == 0U && first_unexpected == 0xFFU) {
+            log_line(TAG_TEST, "Classification: FAIL_MISO_STUCK_HIGH (all reads 0xFF; radio unselected/unpowered/disconnected)");
+        } else if (valid_count > 0U && fail_count > 0U) {
+            log_line(TAG_TEST, "Classification: FAIL_INTERMITTENT (intermittent reads; check signal integrity, contact, or clock noise)");
+        } else {
+            log_line(TAG_TEST, "Classification: FAIL_UNEXPECTED_VALUE (unexpected silicon version; verify module chip type)");
+        }
+
+        delay_ms(2000U);
+    }
+}
+#endif
+
 /*
  * Node A (Transmitter and Hop Master)
  * Step A2: SPI1 Master Mode 0, RegVersion check, retry logic, and safe halt.
@@ -616,7 +915,11 @@ static void step2_mock_run(void) {
 int main(void) {
     baremetal_init();
 
-#if defined(STEP2_MOCK_TEST)
+#if defined(STEP4_RADIO_SPI_DIAG)
+    step4_radio_spi_diag_run();
+#elif defined(STEP3_FHSS_MOCK)
+    step3_fhss_mock_run();
+#elif defined(STEP2_MOCK_TEST)
     step2_mock_run();
 #elif defined(STEP1_UART_TEST)
     step1_uart_test_run();
