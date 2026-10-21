@@ -336,8 +336,351 @@ static void test_step2_protocol(void) {
     printf("[HOST_TEST] test_step2_protocol: PASS\n");
 }
 
+#include "step3_fhss_mock.h"
+
+static void test_step3_state_machine(void) {
+    step3_fsm_t fsm;
+    step3_fsm_init(&fsm);
+
+    /* 1. Initial State Verification */
+    assert(fsm.state == STEP3_STATE_SEARCH);
+    assert(fsm.current_ch == 0);
+    assert(fsm.current_dwell_ms == 120);
+    assert(fsm.have_last == 0);
+    assert(fsm.consecutive_missed == 0);
+    assert(fsm.rx_pass_count == 0);
+
+    /* 2. Envelope CRC Rejection in SEARCH */
+    mock_rx_reset();
+    const uint8_t bad_crc_env[15] = {
+        0x7E, 0x00, 0x0B,
+        0xA1, 0x05, 0x03, 0xE8, 0x6A, 0x7D, 0x48, 0x45, 0x4C, 0x4C, 0x4F,
+        0xFF /* Corrupted envelope CRC */
+    };
+    mock_rx_push(bad_crc_env, 15);
+    fhss_packet_t ack;
+    uint8_t tx_ch = 0xFF;
+    fhss_packet_t rx_pkt;
+    uint16_t avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    step3_rx_outcome_t outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_ERR_ENV_CRC);
+    assert(fsm.state == STEP3_STATE_SEARCH);
+    assert(fsm.env_err_count == 1);
+    assert(fsm.tx_ack_count == 0);
+
+    /* 3. Wrong Channel Rejection in SEARCH (envelope has ch=1 instead of home ch=0) */
+    mock_rx_reset();
+    uint8_t ch1_env[15] = {
+        0x7E, 0x01, 0x0B,
+        0xA1, 0x05, 0x03, 0xE8, 0x6A, 0x7D, 0x48, 0x45, 0x4C, 0x4C, 0x4F,
+        0x00
+    };
+    ch1_env[14] = crc8_smbus_cont(&ch1_env[1], 13, CRC8_SMBUS_INIT);
+    mock_rx_push(ch1_env, 15);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_REJECT_WRONG_CH);
+    assert(fsm.state == STEP3_STATE_SEARCH);
+    assert(fsm.tx_ack_count == 0);
+
+    /* 4. Protocol Tag Rejection in SEARCH */
+    mock_rx_reset();
+    uint8_t bad_tag_env[15] = {
+        0x7E, 0x00, 0x0B,
+        0xA1, 0x05, 0x03, 0xE8, 0x6A, 0x00 /* Bad tag */, 0x48, 0x45, 0x4C, 0x4C, 0x4F,
+        0x00
+    };
+    bad_tag_env[14] = crc8_smbus_cont(&bad_tag_env[1], 13, CRC8_SMBUS_INIT);
+    mock_rx_push(bad_tag_env, 15);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_REJECT_TAG);
+    assert(fsm.state == STEP3_STATE_SEARCH);
+    assert(fsm.tx_ack_count == 0);
+
+    /* 5. Valid HOP Packet in SEARCH -> Transitions to LOCKED */
+    mock_rx_reset();
+    fhss_packet_t hop_pkt;
+    hop_pkt.ver_type = (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_HOP);
+    hop_pkt.seq = 200;
+    hop_pkt.msg_id = 0;
+    hop_pkt.frag = 0;
+    uint8_t hop_mask = fhss_generate_mask(200, 0);
+    hop_pkt.hop_masked = (uint8_t)(((7 << 5) | 31) ^ hop_mask); /* next_ch=7, code=31 */
+    hop_pkt.payload_len = 0;
+
+    uint8_t hop_wire[16];
+    uint8_t hop_wire_len = 0;
+    assert(fhss_build_packet(&hop_pkt, hop_wire, &hop_wire_len) == OK);
+    assert(hop_wire_len == 6);
+    assert(hop_wire[4] == 0xA6);
+    assert(hop_wire[5] == 0x82); /* Matches frozen vector from CONTEXT.md line 129 */
+
+    uint8_t hop_env[16];
+    hop_env[0] = 0x7E;
+    hop_env[1] = 0x00;
+    hop_env[2] = hop_wire_len;
+    memcpy(&hop_env[3], hop_wire, hop_wire_len);
+    hop_env[3 + hop_wire_len] = crc8_smbus_cont(&hop_env[1], (uint8_t)(2 + hop_wire_len), CRC8_SMBUS_INIT);
+    mock_rx_push(hop_env, (uint16_t)(4 + hop_wire_len));
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_PASS_LOCKED);
+    assert(fsm.state == STEP3_STATE_LOCKED);
+    assert(fsm.current_ch == 0);
+    assert(fsm.current_dwell_ms == 120);
+    assert(fsm.next_ch == 7);
+    assert(fsm.next_dwell_ms == 235);
+    assert(fsm.tx_ack_count == 1);
+    assert(ack.ver_type == (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_ACK));
+    assert(ack.msg_id == 0);
+    assert(tx_ch == 0);
+
+    /* 6. Replay Rule Check in LOCKED (diff == 0) */
+    mock_rx_push(hop_env, (uint16_t)(4 + hop_wire_len));
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_REJECT_REPLAY);
+    assert(fsm.state == STEP3_STATE_LOCKED);
+    assert(fsm.replay_count == 1);
+
+    /* 7. Hop Timer Fires -> Advances to Channel 7 */
+    step3_timer_event_t evt = step3_fsm_on_hop_timer(&fsm);
+    assert(evt == STEP3_TIMER_EVENT_HOP);
+    assert(fsm.current_ch == 7);
+    assert(fsm.current_dwell_ms == 235);
+    assert(fsm.got_packet_this_hop == 0);
+
+    /* 8. Three Missed Hops on Channel 7 -> Transitions to LOST -> SEARCH */
+    evt = step3_fsm_on_hop_timer(&fsm);
+    assert(evt == STEP3_TIMER_EVENT_HOP);
+    assert(fsm.consecutive_missed == 1);
+
+    evt = step3_fsm_on_hop_timer(&fsm);
+    assert(evt == STEP3_TIMER_EVENT_HOP);
+    assert(fsm.consecutive_missed == 2);
+
+    evt = step3_fsm_on_hop_timer(&fsm);
+    assert(evt == STEP3_TIMER_EVENT_LOST);
+    assert(fsm.state == STEP3_STATE_SEARCH);
+    assert(fsm.current_ch == 0);
+    assert(fsm.current_dwell_ms == 120);
+    assert(fsm.have_last == 0);
+
+    /* 9. Valid Stage 2 DATA Vector in SEARCH -> Transitions to LOCKED */
+    mock_rx_reset();
+    const uint8_t valid_stage2_env[15] = {
+        0x7E, 0x00, 0x0B,
+        0xA1, 0x05, 0x03, 0xE8, 0x6A, 0x7D, 0x48, 0x45, 0x4C, 0x4C, 0x4F,
+        0x18
+    };
+    mock_rx_push(valid_stage2_env, 15);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_PASS_LOCKED);
+    assert(fsm.state == STEP3_STATE_LOCKED);
+    assert(fsm.next_ch == 5);
+    assert(fsm.next_dwell_ms == 165);
+    assert(ack.msg_id == 3);
+    assert(ack.frag == 0xE0);
+    assert(ack.payload[0] == 0x04); /* Bit 2 set for fragment idx 2 */
+
+    /* 10. Advance Hop to Channel 5 */
+    evt = step3_fsm_on_hop_timer(&fsm);
+    assert(evt == STEP3_TIMER_EVENT_HOP);
+    assert(fsm.current_ch == 5);
+    assert(fsm.current_dwell_ms == 165);
+
+    /* 11. Receive First DATA Frame on Channel 5 */
+    mock_rx_reset();
+    fhss_packet_t p2;
+    p2.ver_type = (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_DATA);
+    p2.seq = 6;
+    p2.msg_id = 3;
+    p2.frag = (7 << 5) | (3 << 2); /* TOTAL=8, IDX=3 */
+    p2.hop_masked = (uint8_t)(((2 << 5) | 10) ^ fhss_generate_mask(6, 0)); /* next_ch=2, code=10 */
+    p2.payload[0] = 'W'; p2.payload[1] = 'O'; p2.payload[2] = 'R'; p2.payload[3] = 'L'; p2.payload[4] = 'D';
+    p2.payload_len = 5;
+
+    uint8_t wire2[16];
+    uint8_t len2 = 0;
+    assert(fhss_build_packet(&p2, wire2, &len2) == OK);
+
+    uint8_t env2[32];
+    env2[0] = 0x7E;
+    env2[1] = 5; /* Channel 5 */
+    env2[2] = len2;
+    memcpy(&env2[3], wire2, len2);
+    env2[3 + len2] = crc8_smbus_cont(&env2[1], (uint8_t)(2 + len2), CRC8_SMBUS_INIT);
+    mock_rx_push(env2, (uint16_t)(4 + len2));
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_PASS_CONTINUED);
+    assert(fsm.state == STEP3_STATE_LOCKED);
+    assert(fsm.is_first_of_hop == 1); /* First packet of this hop */
+    assert(fsm.current_ch == 5);
+    assert(fsm.next_ch == 2);
+    assert(fsm.next_dwell_ms == (80 + 10 * 5)); /* 130 ms */
+    assert(tx_ch == 5);
+    assert(ack.msg_id == 3);
+    assert(ack.payload[0] == 0x08); /* Bit 3 set for fragment idx 3 */
+
+    /* 12. Receive Second DATA Frame on Channel 5 in the Same Hop */
+    mock_rx_reset();
+    fhss_packet_t p3;
+    p3.ver_type = (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_DATA);
+    p3.seq = 7;
+    p3.msg_id = 3;
+    p3.frag = (7 << 5) | (4 << 2); /* TOTAL=8, IDX=4 */
+    p3.hop_masked = (uint8_t)(((2 << 5) | 10) ^ fhss_generate_mask(7, 0));
+    p3.payload[0] = 'X';
+    p3.payload_len = 1;
+
+    uint8_t wire3[16];
+    uint8_t len3 = 0;
+    assert(fhss_build_packet(&p3, wire3, &len3) == OK);
+
+    uint8_t env3[32];
+    env3[0] = 0x7E;
+    env3[1] = 5; /* Channel 5 */
+    env3[2] = len3;
+    memcpy(&env3[3], wire3, len3);
+    env3[3 + len3] = crc8_smbus_cont(&env3[1], (uint8_t)(2 + len3), CRC8_SMBUS_INIT);
+    mock_rx_push(env3, (uint16_t)(4 + len3));
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step3_fsm_process_incoming(
+        &fsm, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP3_RX_PASS_CONTINUED);
+    assert(fsm.state == STEP3_STATE_LOCKED);
+    assert(fsm.is_first_of_hop == 0); /* Second packet must NOT be marked as first of hop! */
+    assert(fsm.current_ch == 5);
+    assert(tx_ch == 5);
+    assert(ack.payload[0] == 0x10); /* Bit 4 set */
+
+    printf("[HOST_TEST] test_step3_state_machine: PASS\n");
+}
+
+#include "step4_radio_spi_diag.h"
+
+static uint8_t s_mock_reg_ver_val = 0x12;
+static status_t s_mock_reg_ver_status = OK;
+static uint8_t s_mock_reg_ver_call_count = 0;
+static uint8_t s_mock_reg_ver_glitch_at = 0xFF;
+static uint8_t s_mock_reg_ver_glitch_val = 0x00;
+
+static status_t mock_read_reg_custom(uint8_t addr, uint8_t *val) {
+    (void)addr;
+    if (val == NULL) return ERR_NULL;
+    if (s_mock_reg_ver_call_count == s_mock_reg_ver_glitch_at) {
+        *val = s_mock_reg_ver_glitch_val;
+    } else {
+        *val = s_mock_reg_ver_val;
+    }
+    s_mock_reg_ver_call_count++;
+    return s_mock_reg_ver_status;
+}
+
+static void test_step4_spi_diag(void) {
+    step4_diag_result_t res;
+
+    /* 1. NULL safety */
+    step4_run_diagnostic(NULL, mock_read_reg_custom);
+    step4_run_diagnostic(&res, NULL);
+
+    /* 2. All 32 reads passing (0x12) */
+    s_mock_reg_ver_val = 0x12;
+    s_mock_reg_ver_status = OK;
+    s_mock_reg_ver_call_count = 0;
+    s_mock_reg_ver_glitch_at = 0xFF;
+    step4_run_diagnostic(&res, mock_read_reg_custom);
+    assert(res.total_reads == STEP4_READ_COUNT);
+    assert(res.pass_count == STEP4_READ_COUNT);
+    assert(res.fail_count == 0);
+    assert(res.first_unexpected_valid == 0);
+    assert(res.all_same == 1);
+    for (int i = 0; i < STEP4_READ_COUNT; i++) {
+        assert(res.reads[i] == 0x12);
+        assert(res.statuses[i] == OK);
+    }
+
+    /* 3. All 32 reads returning 0x00 (e.g. MISO low / reset / unpowered) */
+    s_mock_reg_ver_val = 0x00;
+    s_mock_reg_ver_status = OK;
+    s_mock_reg_ver_call_count = 0;
+    s_mock_reg_ver_glitch_at = 0xFF;
+    step4_run_diagnostic(&res, mock_read_reg_custom);
+    assert(res.total_reads == STEP4_READ_COUNT);
+    assert(res.pass_count == 0);
+    assert(res.fail_count == STEP4_READ_COUNT);
+    assert(res.first_unexpected == 0x00);
+    assert(res.first_unexpected_valid == 1);
+    assert(res.all_same == 1);
+
+    /* 4. All 32 reads returning 0xFF (e.g. floating / pull-up) */
+    s_mock_reg_ver_val = 0xFF;
+    s_mock_reg_ver_status = OK;
+    s_mock_reg_ver_call_count = 0;
+    s_mock_reg_ver_glitch_at = 0xFF;
+    step4_run_diagnostic(&res, mock_read_reg_custom);
+    assert(res.total_reads == STEP4_READ_COUNT);
+    assert(res.pass_count == 0);
+    assert(res.fail_count == STEP4_READ_COUNT);
+    assert(res.first_unexpected == 0xFF);
+    assert(res.first_unexpected_valid == 1);
+    assert(res.all_same == 1);
+
+    /* 5. Inconsistent reads (glitch at read 5) */
+    s_mock_reg_ver_val = 0x12;
+    s_mock_reg_ver_status = OK;
+    s_mock_reg_ver_call_count = 0;
+    s_mock_reg_ver_glitch_at = 5;
+    s_mock_reg_ver_glitch_val = 0x00;
+    step4_run_diagnostic(&res, mock_read_reg_custom);
+    assert(res.total_reads == STEP4_READ_COUNT);
+    assert(res.pass_count == STEP4_READ_COUNT - 1);
+    assert(res.fail_count == 1);
+    assert(res.first_unexpected == 0x00);
+    assert(res.first_unexpected_valid == 1);
+    assert(res.all_same == 0);
+    assert(res.reads[5] == 0x00);
+    assert(res.reads[0] == 0x12);
+
+    /* 6. SPI timeout failure */
+    s_mock_reg_ver_val = 0x00;
+    s_mock_reg_ver_status = ERR_TIMEOUT;
+    s_mock_reg_ver_call_count = 0;
+    s_mock_reg_ver_glitch_at = 0xFF;
+    step4_run_diagnostic(&res, mock_read_reg_custom);
+    assert(res.total_reads == STEP4_READ_COUNT);
+    assert(res.pass_count == 0);
+    assert(res.fail_count == STEP4_READ_COUNT);
+    assert(res.first_unexpected == 0xEE);
+    assert(res.first_unexpected_valid == 1);
+    assert(res.all_same == 1);
+
+    printf("[HOST_TEST] test_step4_spi_diag: PASS\n");
+}
+
 int main(void) {
-    printf("--- Running Node B Host Tests (Step B0, B2, Step 1 & Stage 2) ---\n");
+    printf("--- Running Node B Host Tests (Step B0, B2, Step 1, Stage 2, Stage 3 & Stage 4) ---\n");
     test_status_strings();
     test_channel_plan();
     test_log_formatter();
@@ -345,6 +688,8 @@ int main(void) {
     test_sx1278_spi();
     test_step1_framing();
     test_step2_protocol();
+    test_step3_state_machine();
+    test_step4_spi_diag();
     printf("--- All Host Tests Passed ---\n");
     return 0;
 }

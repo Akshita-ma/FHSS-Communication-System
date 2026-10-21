@@ -35,6 +35,8 @@ OBJS        = $(BUILD_DIR)/status.o \
               $(BUILD_DIR)/demo_node_b.o \
               $(BUILD_DIR)/step1_uart_test.o \
               $(BUILD_DIR)/step2_mock.o \
+              $(BUILD_DIR)/step3_fhss_mock.o \
+              $(BUILD_DIR)/step4_radio_spi_diag.o \
               $(BUILD_DIR)/node_b_rx.o
 
 # Host test sources
@@ -45,12 +47,14 @@ HOST_SRCS   = ../common/status.c \
               ../common/fhss_protocol.c \
               node_b_f4/step1_uart_test.c \
               node_b_f4/step2_mock.c \
+              node_b_f4/step3_fhss_mock.c \
+              node_b_f4/step4_radio_spi_diag.c \
               tests/host/mock_hal.c \
               tests/host/test_b0_host.c
 
 HOST_CFLAGS = -Wall -Wextra -Werror -I../common -Itests/host -Inode_b_f4 -DHOST_TEST
 
-.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock
+.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock step3_fhss_mock step3-fhss-mock flash_step3 flash_step3_mock step4_radio_spi_diag step4-radio-spi-diag flash_step4 flash_step4_radio_spi_diag
 
 step1-uart-test: CFLAGS += -DSTEP1_UART_TEST
 step1-uart-test: clean
@@ -61,8 +65,8 @@ step1-uart-test: clean
 	@echo "--- Step 1 UART Test Build complete ---"
 	$(SIZE) $(BUILD_DIR)/step1_uart_test.elf
 
-flash_step1: $(BUILD_DIR)/step1_uart_test.elf
-	openocd $(OPENOCD_CFG) -c "program $< verify reset exit"
+flash_step1: step1-uart-test
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step1_uart_test.elf verify reset exit"
 
 step2_mock: CFLAGS += -DSTEP2_MOCK
 step2_mock: clean
@@ -75,10 +79,42 @@ step2_mock: clean
 
 step2-mock: step2_mock
 
-flash_step2: $(BUILD_DIR)/step2_mock.elf
-	openocd $(OPENOCD_CFG) -c "program $< verify reset exit"
+flash_step2: step2_mock
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step2_mock.elf verify reset exit"
 
 flash_step2_mock: flash_step2
+
+step3_fhss_mock: CFLAGS += -DSTEP3_FHSS_MOCK
+step3_fhss_mock: clean
+	@$(MAKE) $(BUILD_DIR)/step3_fhss_mock.elf $(BUILD_DIR)/step3_fhss_mock.bin $(BUILD_DIR)/step3_fhss_mock.hex TARGET=step3_fhss_mock CFLAGS="$(CFLAGS) -DSTEP3_FHSS_MOCK"
+	@cp -f $(BUILD_DIR)/step3_fhss_mock.elf $(BUILD_DIR)/$(ALT_TARGET).elf 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step3_fhss_mock.bin $(BUILD_DIR)/$(ALT_TARGET).bin 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step3_fhss_mock.hex $(BUILD_DIR)/$(ALT_TARGET).hex 2>/dev/null || true
+	@echo "--- Step 3 FHSS Mock Build complete ---"
+	$(SIZE) $(BUILD_DIR)/step3_fhss_mock.elf
+
+step3-fhss-mock: step3_fhss_mock
+
+flash_step3: step3_fhss_mock
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step3_fhss_mock.elf verify reset exit"
+
+flash_step3_mock: flash_step3
+
+step4_radio_spi_diag: CFLAGS += -DSTEP4_RADIO_SPI_DIAG
+step4_radio_spi_diag: clean
+	@$(MAKE) $(BUILD_DIR)/step4_radio_spi_diag.elf $(BUILD_DIR)/step4_radio_spi_diag.bin $(BUILD_DIR)/step4_radio_spi_diag.hex TARGET=step4_radio_spi_diag CFLAGS="$(CFLAGS) -DSTEP4_RADIO_SPI_DIAG"
+	@cp -f $(BUILD_DIR)/step4_radio_spi_diag.elf $(BUILD_DIR)/$(ALT_TARGET).elf 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step4_radio_spi_diag.bin $(BUILD_DIR)/$(ALT_TARGET).bin 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step4_radio_spi_diag.hex $(BUILD_DIR)/$(ALT_TARGET).hex 2>/dev/null || true
+	@echo "--- Step 4 Radio SPI Diag Build complete ---"
+	$(SIZE) $(BUILD_DIR)/step4_radio_spi_diag.elf
+
+step4-radio-spi-diag: step4_radio_spi_diag
+
+flash_step4: step4_radio_spi_diag
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step4_radio_spi_diag.elf verify reset exit"
+
+flash_step4_radio_spi_diag: flash_step4
 
 demo: CFLAGS += -DDEMO_USART_LINK -DDEMO_TRACE
 ifeq ($(RF_KEYING),1)
@@ -126,10 +162,14 @@ $(BUILD_DIR)/$(TARGET).elf: $(OBJS)
 	@mkdir -p $(BUILD_DIR)
 	$(CC) $(OBJS) $(LDFLAGS) -o $@
 
-$(BUILD_DIR)/$(TARGET).bin: $(BUILD_DIR)/$(TARGET).elf
+$(BUILD_DIR)/%.elf: $(OBJS)
+	@mkdir -p $(BUILD_DIR)
+	$(CC) $(OBJS) $(LDFLAGS) -o $@
+
+$(BUILD_DIR)/%.bin: $(BUILD_DIR)/%.elf
 	$(OBJCOPY) -O binary $< $@
 
-$(BUILD_DIR)/$(TARGET).hex: $(BUILD_DIR)/$(TARGET).elf
+$(BUILD_DIR)/%.hex: $(BUILD_DIR)/%.elf
 	$(OBJCOPY) -O ihex $< $@
 
 # OpenOCD programming and debug targets

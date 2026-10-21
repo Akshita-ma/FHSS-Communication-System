@@ -9,8 +9,10 @@
 #include "demo_node_b.h"
 #include "step1_uart_test.h"
 #include "step2_mock.h"
+#include "step3_fhss_mock.h"
+#include "step4_radio_spi_diag.h"
 
-#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK)
+#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK) && !defined(STEP3_FHSS_MOCK) && !defined(STEP4_RADIO_SPI_DIAG)
 /* Global test variables for checking .data and .bss initialization */
 static volatile uint32_t g_test_data = 0x12345678;
 static volatile uint32_t g_test_bss = 0;
@@ -51,7 +53,7 @@ static void run_selftests(void) {
 }
 #endif
 
-#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK)
+#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK) && !defined(STEP3_FHSS_MOCK) && !defined(STEP4_RADIO_SPI_DIAG)
 static void log_reg_mismatch(uint8_t ver) {
     if (ver == 0x00) {
         Log_Msg("RADIO", "RegVersion=0x00 mismatch (MISO stuck low)");
@@ -657,7 +659,11 @@ static void run_selftest_miso_static(void) {
 int main(void) {
     baremetal_init();
 
-#if defined(STEP2_MOCK)
+#if defined(STEP4_RADIO_SPI_DIAG)
+    step4_radio_spi_diag_run();
+#elif defined(STEP3_FHSS_MOCK)
+    step3_fhss_mock_run();
+#elif defined(STEP2_MOCK)
     step2_mock_run();
 #elif defined(STEP1_UART_TEST)
     step1_uart_test_run();
