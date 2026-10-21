@@ -288,9 +288,14 @@ void baremetal_init(void) {
     GPIOA->CRL &= ~(0xFUL << 28);
     GPIOA->CRL |= (0xBUL << 28);
 
-    /* PA9 in CRH bits [7:4] */
+    /* PA9 in CRH bits [7:4]: Output AF Push-Pull 50 MHz (MODE=11, CNF=10 -> 0xB) */
     GPIOA->CRH &= ~(0xFUL << 4);
     GPIOA->CRH |= (0xBUL << 4);
+
+    /* PA10 in CRH bits [11:8]: Input with Pull-Up (MODE=00, CNF=10 -> 0x8) */
+    GPIOA->CRH &= ~(0xFUL << 8);
+    GPIOA->CRH |= (0x8UL << 8);
+    GPIOA->BSRR = (1UL << 10); /* Enable pull-up on RX pin */
 
     /* 5. Configure GPIOB pins:
      * PB0: NSS - Output GP Push-Pull 50 MHz (MODE=11, CNF=00 -> 0x3)
@@ -299,9 +304,9 @@ void baremetal_init(void) {
     GPIOB->CRL |= (0x3UL << 0);
     GPIOB->BSRR = (1UL << 0); /* NSS starts HIGH (unselected) */
 
-    /* 6. Configure USART1: BRR = 0x0045 (115200 baud @ 8 MHz PCLK2) */
+    /* 6. Configure USART1: BRR = 0x0045 (115200 baud @ 8 MHz PCLK2), TX & RX enabled */
     USART1->BRR = 0x0045UL;
-    USART1->CR1 = USART_CR1_UE | USART_CR1_TE;
+    USART1->CR1 = USART_CR1_UE | USART_CR1_TE | USART_CR1_RE;
 
     /* 7. Configure SPI1:
      * - Master mode: MSTR = 1
@@ -356,7 +361,7 @@ void baremetal_init(void) {
     GPIOA->BRR = (1UL << 8);
 #endif
 
-#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST) || defined(STEP6_DATA_MOCK) || defined(STEP7_ARQ_MOCK)
+#if defined(DEMO_USART_LINK) || defined(STEP1_UART_TEST) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST) || defined(STEP6_DATA_MOCK) || defined(STEP7_ARQ_MOCK) || defined(INTERACTIVE_MODE)
     void air_mock_init(void);
     air_mock_init();
 #endif

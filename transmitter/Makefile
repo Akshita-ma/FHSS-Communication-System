@@ -30,7 +30,9 @@ LDFLAGS = -mcpu=cortex-m3 -mthumb \
 SRCS_F103 = node_a_f103/startup_f103.c \
             node_a_f103/stm32_baremetal.c \
             node_a_f103/node_a_tx.c \
-            node_a_f103/air_mock_f103.c
+            node_a_f103/air_mock_f103.c \
+            node_a_f103/aead_chacha20_poly1305.c \
+            node_a_f103/nonce_mgr.c
 
 OBJS_F103 = $(patsubst node_a_f103/%.c,$(BUILD_DIR)/%.o,$(SRCS_F103)) \
             $(BUILD_DIR)/sx1278_fsk.o \
@@ -40,11 +42,13 @@ OBJS_F103 = $(patsubst node_a_f103/%.c,$(BUILD_DIR)/%.o,$(SRCS_F103)) \
 # Host test sources
 HOST_TEST_SRCS = tests/host/test_main.c \
                  tests/host/mock_hal.c \
+                 node_a_f103/aead_chacha20_poly1305.c \
+                 node_a_f103/nonce_mgr.c \
                  ../common/sx1278_fsk.c \
                  ../common/fhss_protocol.c
 HOST_TEST_BIN  = $(BUILD_DIR)/host_tests
 
-.PHONY: all clean flash test dump_vector selftest_loopback selftest_pins demo step1_test step1 step2_mock step2 step3_fhss_mock step3 step4_radio_spi_diag step4 step5_fault_test step5 step6_data_mock step6 step7_arq_mock step7
+.PHONY: all clean flash test dump_vector selftest_loopback selftest_pins demo step1_test step1 step2_mock step2 step3_fhss_mock step3 step4_radio_spi_diag step4 step5_fault_test step5 step6_data_mock step6 step7_arq_mock step7 interactive app
 
 ifeq ($(RF_KEYING),1)
 DEMO_EXTRA = -DDEMO_RF_KEYING
@@ -95,6 +99,12 @@ step7_arq_mock:
 	$(MAKE) all EXTRA_CFLAGS="-DDEMO_USART_LINK -DSTEP7_ARQ_MOCK"
 
 step7: step7_arq_mock
+
+interactive:
+	$(MAKE) clean
+	$(MAKE) all EXTRA_CFLAGS="-DDEMO_USART_LINK -DINTERACTIVE_MODE"
+
+app: interactive
 
 demo:
 	$(MAKE) clean

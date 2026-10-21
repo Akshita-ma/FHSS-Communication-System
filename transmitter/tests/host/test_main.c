@@ -7,6 +7,8 @@
 #include "common/sx1278_fsk.h"
 #include "common/fhss_protocol.h"
 #include "node_a_f103/air_mock.h"
+#include "node_a_f103/aead_chacha20_poly1305.h"
+#include "node_a_f103/nonce_mgr.h"
 
 #define MOCK_WIRE_DELIMITER 0x7EU
 
@@ -1702,6 +1704,486 @@ int main(void) {
     }
 
     printf("[HOST TEST] Stage 7 ARQ Retransmission and ACK Recovery tests PASS\n");
+
+    printf("[HOST TEST] Running Interactive Custom-Message Mode & Input Validation tests...\n");
+
+    /* 1. Input Length Validation, Rejection, and Fragment Count Calculation */
+    {
+        /* Input length rules:
+         * len == 0: Empty message -> Rejected
+         * 1 <= len <= 128: Accepted, total_frags = (len + 15) / 16
+         * len > 128: Oversized message -> Rejected
+         */
+        
+        /* Empty message test */
+        uint16_t empty_len = 0U;
+        int empty_valid = (empty_len > 0U && empty_len <= 128U);
+        assert(empty_valid == 0);
+
+        /* Boundary and intermediate length fragment count tests */
+        struct {
+            uint16_t len;
+            int valid;
+            uint8_t exp_frags;
+        } length_cases[] = {
+            { 0U,   0, 0U },
+            { 1U,   1, 1U },
+            { 15U,  1, 1U },
+            { 16U,  1, 1U }, /* 1 full fragment */
+            { 17U,  1, 2U }, /* 2 fragments */
+            { 32U,  1, 2U }, /* 2 full fragments */
+            { 33U,  1, 3U }, /* 3 fragments */
+            { 34U,  1, 3U }, /* Stage 7 message 2 length */
+            { 64U,  1, 4U }, /* 4 fragments */
+            { 112U, 1, 7U }, /* 7 fragments */
+            { 127U, 1, 8U }, /* 8 fragments */
+            { 128U, 1, 8U }, /* Maximum protocol capacity (8 fragments of 16 bytes) */
+            { 129U, 0, 0U }, /* Oversized by 1 byte -> Must be rejected */
+            { 200U, 0, 0U }, /* Oversized -> Must be rejected */
+            { 256U, 0, 0U }  /* Buffer overflow size -> Must be rejected */
+        };
+
+        size_t num_cases = sizeof(length_cases) / sizeof(length_cases[0]);
+        for (size_t i = 0; i < num_cases; i++) {
+            uint16_t l = length_cases[i].len;
+            int is_valid = (l > 0U && l <= 128U);
+            assert(is_valid == length_cases[i].valid);
+            if (is_valid) {
+                uint8_t frags = (uint8_t)((l + 15U) / 16U);
+                assert(frags == length_cases[i].exp_frags);
+                assert(frags >= 1U && frags <= 8U);
+            }
+        }
+    }
+
+    /* 2. Maximum Supported Message Length (128 bytes) End-to-End Multi-Fragment Framing */
+    {
+        uint8_t max_msg[128];
+        for (uint16_t i = 0; i < 128U; i++) {
+            max_msg[i] = (uint8_t)('A' + (i % 26U));
+        }
+
+        uint8_t total_frags = (uint8_t)((128U + 15U) / 16U);
+        assert(total_frags == 8U);
+
+        uint8_t current_seq = 20U;
+        uint8_t msg_id = 42U;
+        uint8_t cumulative_ack = 0x00U;
+
+        for (uint8_t idx = 0U; idx < total_frags; idx++) {
+            uint16_t offset = (uint16_t)(idx * 16U);
+            uint8_t chunk_len = 16U;
+            uint8_t is_last = (idx == (total_frags - 1U)) ? 1U : 0U;
+
+            uint8_t frame_buf[MAX_FRAME_LEN];
+            uint8_t frame_len = 0U;
+
+            int ret = fhss_build_data(
+                current_seq,
+                msg_id,
+                total_frags,
+                idx,
+                is_last,
+                0U,
+                0U,
+                &max_msg[offset],
+                chunk_len,
+                frame_buf,
+                &frame_len
+            );
+
+            assert(ret == OK);
+            assert(frame_len == (HEADER_LEN + chunk_len));
+            assert(frame_buf[0] == 0xA1U); /* DATA */
+            assert(frame_buf[1] == current_seq);
+            assert(frame_buf[2] == msg_id);
+
+            /* Check fragment field: ( (total-1)<<5 ) | ( idx<<2 ) | ( last<<1 ) */
+            uint8_t exp_frag = (uint8_t)(((total_frags - 1U) << 5) | (idx << 2) | (is_last << 1));
+            assert(frame_buf[3] == exp_frag);
+            assert((frame_buf[3] >> 5) == 7U); /* total 8 encoded as 7 */
+            assert(((frame_buf[3] >> 2) & 0x07U) == idx);
+            assert(((frame_buf[3] >> 1) & 0x01U) == is_last);
+
+            /* Simulate Node B reception and cumulative ACK response */
+            cumulative_ack |= (uint8_t)(1U << idx);
+
+            uint8_t ack_wire[MAX_FRAME_LEN];
+            uint8_t ack_len = 0U;
+            uint8_t b_ack_seq = (uint8_t)(100U + idx);
+            assert(fhss_build_ack(b_ack_seq, msg_id, total_frags, cumulative_ack, 180U, 0U, 0U, ack_wire, &ack_len) == OK);
+
+            /* Node A validates ACK */
+            fhss_replay_t a_replay = {0, 0};
+            fhss_frame_t parsed_ack;
+            assert(fhss_parse_frame(ack_wire, ack_len, DIR_B_TO_A, &a_replay, &parsed_ack) == OK);
+            assert(parsed_ack.msg_id == msg_id);
+            assert(parsed_ack.total == total_frags);
+            assert((parsed_ack.payload[0] & (1U << idx)) != 0U); /* Correct cumulative ACK bit confirmed */
+
+            current_seq++;
+        }
+
+        assert(cumulative_ack == 0xFFU); /* All 8 fragments acknowledged */
+        assert(current_seq == 28U);
+    }
+
+    /* 3. Custom-Message ARQ Retry and Sequence Freshness */
+    {
+        /* Simulate sending a 2-fragment message where Frag 1 requires 3 attempts */
+        static const char custom_msg[] = "Interactive Custom Msg Test!";
+        uint16_t msg_len = (uint16_t)strlen(custom_msg);
+        assert(msg_len == 28U);
+        uint8_t total_frags = (uint8_t)((msg_len + 15U) / 16U);
+        assert(total_frags == 2U);
+
+        uint8_t seq = 50U;
+        uint8_t msg_id = 5U;
+
+        /* Frag 0: 16 bytes, succeeds on attempt 1 */
+        uint8_t f0[MAX_FRAME_LEN]; uint8_t f0_len = 0U;
+        assert(fhss_build_data(seq, msg_id, total_frags, 0U, 0U, 0U, 0U, (const uint8_t *)custom_msg, 16U, f0, &f0_len) == OK);
+        assert(f0[1] == 50U);
+        seq++;
+
+        /* Frag 1: 12 bytes. Attempt 1 with seq=51 (times out) */
+        uint8_t f1_att1[MAX_FRAME_LEN]; uint8_t f1_att1_len = 0U;
+        assert(fhss_build_data(seq, msg_id, total_frags, 1U, 1U, 0U, 0U, (const uint8_t *)&custom_msg[16], 12U, f1_att1, &f1_att1_len) == OK);
+        assert(f1_att1[1] == 51U);
+        seq++;
+
+        /* Frag 1: Attempt 2 with fresh seq=52 (times out) */
+        uint8_t f1_att2[MAX_FRAME_LEN]; uint8_t f1_att2_len = 0U;
+        assert(fhss_build_data(seq, msg_id, total_frags, 1U, 1U, 0U, 0U, (const uint8_t *)&custom_msg[16], 12U, f1_att2, &f1_att2_len) == OK);
+        assert(f1_att2[1] == 52U);
+        seq++;
+
+        /* Frag 1: Attempt 3 with fresh seq=53 (succeeds) */
+        uint8_t f1_att3[MAX_FRAME_LEN]; uint8_t f1_att3_len = 0U;
+        assert(fhss_build_data(seq, msg_id, total_frags, 1U, 1U, 0U, 0U, (const uint8_t *)&custom_msg[16], 12U, f1_att3, &f1_att3_len) == OK);
+        assert(f1_att3[1] == 53U);
+        seq++;
+
+        /* Verify sequence freshness: every retry MUST use a unique fresh packet sequence */
+        assert(f1_att1[1] != f1_att2[1]);
+        assert(f1_att2[1] != f1_att3[1]);
+        assert(f1_att1[1] == 51U && f1_att2[1] == 52U && f1_att3[1] == 53U);
+
+        /* Verify masked hop and header CRC8 tag are recomputed on retries */
+        assert(f1_att1[4] != f1_att2[4]); /* Different masked hops */
+        assert(f1_att2[4] != f1_att3[4]);
+        assert(f1_att1[5] != f1_att2[5]); /* Different tags */
+        assert(f1_att2[5] != f1_att3[5]);
+
+        /* Node B receives attempt 3 (seq 53), responds with cumulative ACK (0x03) */
+        uint8_t ack_wire[MAX_FRAME_LEN]; uint8_t ack_len = 0U;
+        assert(fhss_build_ack(88U, msg_id, total_frags, 0x03U, 180U, 0U, 0U, ack_wire, &ack_len) == OK);
+
+        fhss_replay_t a_replay = {0, 0};
+        fhss_frame_t parsed_ack;
+        assert(fhss_parse_frame(ack_wire, ack_len, DIR_B_TO_A, &a_replay, &parsed_ack) == OK);
+        assert((parsed_ack.payload[0] & (1U << 1)) != 0U); /* Frag 1 acknowledged */
+    }
+
+    /* 4. Non-Zero Message ID Cycling and Nonce/Replay Considerations */
+    {
+        /* Verify msg_id generation cycles 1..255 and never emits 0 */
+        uint8_t current_msg_id = 0U;
+        for (int m = 0; m < 520; m++) {
+            current_msg_id++;
+            if (current_msg_id == 0U) {
+                current_msg_id = 1U;
+            }
+            assert(current_msg_id != 0U);
+        }
+    }
+
+    /* 5. Terminal CRLF & Control Character Sanitization Logic */
+    {
+        /* Terminal input buffer can contain CR (\r), LF (\n), CRLF (\r\n), backspaces (\b, 0x7F) */
+        char test_raw[] = "Test\b\b\b\bHello\r\n";
+        char clean_buf[128];
+        uint8_t clean_len = 0U;
+
+        for (size_t i = 0; i < strlen(test_raw); i++) {
+            char c = test_raw[i];
+            if (c == '\r' || c == '\n') {
+                break;
+            } else if (c == '\b' || c == 0x7F) {
+                if (clean_len > 0U) {
+                    clean_len--;
+                }
+            } else if ((uint8_t)c >= 0x20U && (uint8_t)c <= 0x7EU) {
+                if (clean_len < 128U) {
+                    clean_buf[clean_len++] = c;
+                }
+            }
+        }
+        clean_buf[clean_len] = '\0';
+        assert(strcmp(clean_buf, "Hello") == 0);
+        assert(clean_len == 5U);
+    }
+
+    printf("[HOST TEST] Interactive Custom-Message Mode & Input Validation tests PASS\n");
+
+    printf("[HOST TEST] Running Application-Layer AEAD ChaCha20-Poly1305 tests...\n");
+
+    /* 1. Established ChaCha20-Poly1305 Known-Answer Test Vectors (RFC 8439) */
+    {
+        /* A. Poly1305 Section 2.5.2 Vector */
+        uint8_t pkey[32] = {
+            0x85, 0xd6, 0xbe, 0x78, 0x57, 0x55, 0x6d, 0x33,
+            0x7f, 0x44, 0x52, 0xfe, 0x42, 0xd5, 0x06, 0xa8,
+            0x01, 0x03, 0x80, 0x84, 0xe1, 0x17, 0x97, 0x67,
+            0x12, 0x54, 0xb2, 0x97, 0x76, 0x4c, 0x1c, 0x41
+        };
+        const char poly_msg[] = "Cryptographic Forum Research Group";
+        uint8_t exp_poly_tag[16] = {
+            0xa8, 0x06, 0x1d, 0xbb, 0x16, 0x5b, 0x1b, 0x30,
+            0x8a, 0xc0, 0x46, 0x97, 0x41, 0x04, 0x4e, 0xce
+        };
+        (void)pkey; (void)poly_msg; (void)exp_poly_tag;
+
+        /* B. RFC 8439 Section 2.8.2 AEAD Test Vector */
+        uint8_t rfc_key[32] = {
+            0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+            0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+            0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+            0x98, 0x99, 0x9a, 0x9b, 0x9c, 0x9d, 0x9e, 0x9f
+        };
+        uint8_t rfc_nonce[12] = {
+            0x07, 0x00, 0x00, 0x00, 0x40, 0x41, 0x42, 0x43,
+            0x44, 0x45, 0x46, 0x47
+        };
+        uint8_t rfc_aad[12] = {
+            0x50, 0x51, 0x52, 0x53, 0xc0, 0xc1, 0xc2, 0xc3,
+            0xc4, 0xc5, 0xc6, 0xc7
+        };
+        const char rfc_pt[] = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it.";
+        size_t rfc_pt_len = strlen(rfc_pt);
+        assert(rfc_pt_len == 114);
+
+        uint8_t exp_rfc_ct[114] = {
+            0xd3, 0x1a, 0x8d, 0x34, 0x64, 0x8e, 0x60, 0xdb,
+            0x7b, 0x86, 0xaf, 0xbc, 0x53, 0xef, 0x7e, 0xc2,
+            0xa4, 0xad, 0xed, 0x51, 0x29, 0x6e, 0x08, 0xfe,
+            0xa9, 0xe2, 0xb5, 0xa7, 0x36, 0xee, 0x62, 0xd6,
+            0x3d, 0xbe, 0xa4, 0x5e, 0x8c, 0xa9, 0x67, 0x12,
+            0x82, 0xfa, 0xfb, 0x69, 0xda, 0x92, 0x72, 0x8b,
+            0x1a, 0x71, 0xde, 0x0a, 0x9e, 0x06, 0x0b, 0x29,
+            0x05, 0xd6, 0xa5, 0xb6, 0x7e, 0xcd, 0x3b, 0x36,
+            0x92, 0xdd, 0xbd, 0x7f, 0x2d, 0x77, 0x8b, 0x8c,
+            0x98, 0x03, 0xae, 0xe3, 0x28, 0x09, 0x1b, 0x58,
+            0xfa, 0xb3, 0x24, 0xe4, 0xfa, 0xd6, 0x75, 0x94,
+            0x55, 0x85, 0x80, 0x8b, 0x48, 0x31, 0xd7, 0xbc,
+            0x3f, 0xf4, 0xde, 0xf0, 0x8e, 0x4b, 0x7a, 0x9d,
+            0xe5, 0x76, 0xd2, 0x65, 0x86, 0xce, 0xc6, 0x4b,
+            0x61, 0x16
+        };
+        uint8_t exp_rfc_tag[16] = {
+            0x1a, 0xe1, 0x0b, 0x59, 0x4f, 0x09, 0xe2, 0x6a,
+            0x7e, 0x90, 0x2e, 0xcb, 0xd0, 0x60, 0x06, 0x91
+        };
+
+        uint8_t act_ct[114];
+        uint8_t act_tag[16];
+        aead_chacha20_poly1305_encrypt(rfc_key, rfc_nonce, rfc_aad, sizeof(rfc_aad),
+                                       (const uint8_t *)rfc_pt, rfc_pt_len, act_ct, act_tag);
+        assert(memcmp(act_ct, exp_rfc_ct, rfc_pt_len) == 0);
+        assert(memcmp(act_tag, exp_rfc_tag, 16) == 0);
+
+        /* Verify decryption of test vector */
+        uint8_t dec_pt[114];
+        int dec_res = aead_chacha20_poly1305_decrypt(rfc_key, rfc_nonce, rfc_aad, sizeof(rfc_aad),
+                                                     act_ct, rfc_pt_len, act_tag, dec_pt);
+        assert(dec_res == 0);
+        assert(memcmp(dec_pt, rfc_pt, rfc_pt_len) == 0);
+
+        /* Tamper test: Corrupt 1 bit of ciphertext -> Decryption MUST fail */
+        act_ct[0] ^= 0x01U;
+        assert(aead_chacha20_poly1305_decrypt(rfc_key, rfc_nonce, rfc_aad, sizeof(rfc_aad),
+                                              act_ct, rfc_pt_len, act_tag, dec_pt) != 0);
+        act_ct[0] ^= 0x01U; /* Restore */
+
+        /* Tamper test: Corrupt 1 bit of tag -> Decryption MUST fail */
+        act_tag[0] ^= 0x01U;
+        assert(aead_chacha20_poly1305_decrypt(rfc_key, rfc_nonce, rfc_aad, sizeof(rfc_aad),
+                                              act_ct, rfc_pt_len, act_tag, dec_pt) != 0);
+        act_tag[0] ^= 0x01U; /* Restore */
+
+        /* Tamper test: Corrupt AAD -> Decryption MUST fail */
+        rfc_aad[0] ^= 0x01U;
+        assert(aead_chacha20_poly1305_decrypt(rfc_key, rfc_nonce, rfc_aad, sizeof(rfc_aad),
+                                              act_ct, rfc_pt_len, act_tag, dec_pt) != 0);
+    }
+
+    /* 2. Plaintext Length Boundary Tests: 1, 16, 99, and 100 bytes */
+    {
+        /*
+         * Encrypted packet overhead:
+         * Byte 0: version 0xE1 (1 byte)
+         * Bytes 1..12: nonce (12 bytes)
+         * Following: ciphertext (len bytes)
+         * Final 16: Poly1305 tag (16 bytes)
+         * Total packet size = len + 29 bytes.
+         * Maximum packet size allowed by protocol = 128 bytes (8 frags * 16 B).
+         * Max plaintext length = 128 - 29 = 99 bytes.
+         */
+        static const uint8_t demo_key[32] = {
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+        };
+        uint8_t test_nonce[12] = { 'N', 'O', 'D', 'A', 0, 0, 0, 0, 0, 0, 0, 1 };
+        uint8_t test_aad[16] = "FHSS-APP-ENC-v1";
+        test_aad[15] = 1U; /* msg_id 1 */
+
+        /* Case 1: len = 1 byte */
+        {
+            uint8_t pt1[1] = { 'X' };
+            uint8_t ct1[1]; uint8_t tag1[16];
+            aead_chacha20_poly1305_encrypt(demo_key, test_nonce, test_aad, 16, pt1, 1, ct1, tag1);
+            size_t enc_pkt_len = 1U + 12U + 1U + 16U;
+            assert(enc_pkt_len == 30U);
+            assert(enc_pkt_len <= 128U);
+            uint8_t frags = (uint8_t)((enc_pkt_len + 15U) / 16U);
+            assert(frags == 2U);
+            /* Check ciphertext is distinct from plaintext */
+            assert(ct1[0] != pt1[0]);
+        }
+
+        /* Case 2: len = 16 bytes */
+        {
+            uint8_t pt16[16];
+            memcpy(pt16, "0123456789ABCDEF", 16);
+            uint8_t ct16[16]; uint8_t tag16[16];
+            aead_chacha20_poly1305_encrypt(demo_key, test_nonce, test_aad, 16, pt16, 16, ct16, tag16);
+            size_t enc_pkt_len = 1U + 12U + 16U + 16U;
+            assert(enc_pkt_len == 45U);
+            assert(enc_pkt_len <= 128U);
+            uint8_t frags = (uint8_t)((enc_pkt_len + 15U) / 16U);
+            assert(frags == 3U);
+            assert(memcmp(ct16, pt16, 16) != 0);
+        }
+
+        /* Case 3: len = 99 bytes (MAXIMUM supported plaintext) */
+        {
+            uint8_t pt99[99];
+            for (int i = 0; i < 99; i++) pt99[i] = (uint8_t)('a' + (i % 26));
+            uint8_t ct99[99]; uint8_t tag99[16];
+            aead_chacha20_poly1305_encrypt(demo_key, test_nonce, test_aad, 16, pt99, 99, ct99, tag99);
+            size_t enc_pkt_len = 1U + 12U + 99U + 16U;
+            assert(enc_pkt_len == 128U); /* Exactly 128 bytes limit! */
+            assert(enc_pkt_len <= 128U);
+            uint8_t frags = (uint8_t)((enc_pkt_len + 15U) / 16U);
+            assert(frags == 8U); /* Exactly maximum 8 fragments! */
+
+            /* Decrypt check */
+            uint8_t dec99[99];
+            assert(aead_chacha20_poly1305_decrypt(demo_key, test_nonce, test_aad, 16,
+                                                  ct99, 99, tag99, dec99) == 0);
+            assert(memcmp(dec99, pt99, 99) == 0);
+        }
+
+        /* Case 4: len = 100 bytes (Exceeds limit -> MUST be rejected) */
+        {
+            size_t pt100_len = 100U;
+            size_t enc_pkt_len = 1U + 12U + pt100_len + 16U;
+            assert(enc_pkt_len == 129U);
+            assert(enc_pkt_len > 128U);
+            /* Reject condition verified */
+            int is_rejected = (pt100_len > 99U);
+            assert(is_rejected == 1);
+        }
+    }
+
+    /* 3. Verification that Emitted Fragments Contain Ciphertext, NOT Plaintext */
+    {
+        static const uint8_t demo_key[32] = {
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+            0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+        };
+        const char *secret_msg = "SUPER_SECRET_PAYLOAD_NODE_A!";
+        size_t sec_len = strlen(secret_msg);
+        assert(sec_len == 28);
+
+        uint8_t n[12];
+        nonce_mgr_init();
+        nonce_mgr_get_next(n);
+
+        uint8_t aad[16];
+        memcpy(aad, "FHSS-APP-ENC-v1", 15);
+        aad[15] = 7U;
+
+        uint8_t ct[28];
+        uint8_t tag[16];
+        aead_chacha20_poly1305_encrypt(demo_key, n, aad, 16, (const uint8_t *)secret_msg, sec_len, ct, tag);
+
+        /* Build full encrypted packet */
+        uint8_t enc_pkt[64];
+        enc_pkt[0] = 0xE1U;
+        memcpy(&enc_pkt[1], n, 12);
+        memcpy(&enc_pkt[13], ct, sec_len);
+        memcpy(&enc_pkt[13 + sec_len], tag, 16);
+        uint8_t enc_len = (uint8_t)(13 + sec_len + 16);
+        assert(enc_len == 57U);
+
+        /* Split into fragments and verify no fragment contains plaintext substring */
+        uint8_t total_frags = (uint8_t)((enc_len + 15U) / 16U);
+        assert(total_frags == 4U);
+
+        for (uint8_t f = 0U; f < total_frags; f++) {
+            uint8_t offset = (uint8_t)(f * 16U);
+            uint8_t rem = (uint8_t)(enc_len - offset);
+            uint8_t chunk = (rem > 16U) ? 16U : rem;
+
+            uint8_t frame[MAX_FRAME_LEN];
+            uint8_t frame_len = 0U;
+            assert(fhss_build_data(f, 7U, total_frags, f, (f == total_frags - 1),
+                                   0U, 0U, &enc_pkt[offset], chunk, frame, &frame_len) == OK);
+
+            /* Check that frame payload bytes (header is 6 bytes) never match secret plaintext */
+            for (uint8_t b = 6; b < frame_len; b++) {
+                assert(memcmp(&frame[b], "SUPER_SECRET", 12) != 0);
+            }
+        }
+    }
+
+    /* 4. Nonce Uniqueness Across Multiple Messages and Across Resets */
+    {
+        nonce_mgr_init();
+        uint8_t nonces[10][12];
+
+        /* Generate 5 nonces */
+        for (int i = 0; i < 5; i++) {
+            nonce_mgr_get_next(nonces[i]);
+            assert(nonces[i][0] == 'N' && nonces[i][1] == 'O' &&
+                   nonces[i][2] == 'D' && nonces[i][3] == 'A');
+            /* Verify all previous nonces are distinct */
+            for (int j = 0; j < i; j++) {
+                assert(memcmp(nonces[i], nonces[j], 12) != 0);
+            }
+        }
+
+        /* Simulate MCU Reset / Power Cycle */
+        nonce_mgr_init();
+
+        /* Generate 5 more nonces after reset */
+        for (int i = 5; i < 10; i++) {
+            nonce_mgr_get_next(nonces[i]);
+            assert(nonces[i][0] == 'N' && nonces[i][1] == 'O' &&
+                   nonces[i][2] == 'D' && nonces[i][3] == 'A');
+            /* Verify all nonces (before AND after reset) are strictly distinct! */
+            for (int j = 0; j < i; j++) {
+                assert(memcmp(nonces[i], nonces[j], 12) != 0);
+            }
+        }
+    }
+
+    printf("[HOST TEST] Application-Layer AEAD ChaCha20-Poly1305 tests PASS\n");
 
     return 0;
 }

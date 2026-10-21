@@ -4,6 +4,9 @@
 #include "common/log.h"
 #include "common/sx1278_fsk.h"
 #include "stm32f1_regs.h"
+#include "aead_chacha20_poly1305.h"
+#include "nonce_mgr.h"
+#include <string.h>
 
 /* Baseline hardware initialization in stm32_baremetal.c */
 void baremetal_init(void);
@@ -225,13 +228,13 @@ static void selftest_pins_run(void) {
 }
 #endif
 
-#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST) || defined(STEP6_DATA_MOCK) || defined(STEP7_ARQ_MOCK)
+#if defined(DEMO_USART_LINK) || defined(STEP2_MOCK_TEST) || defined(STEP3_FHSS_MOCK) || defined(STEP5_FAULT_TEST) || defined(STEP6_DATA_MOCK) || defined(STEP7_ARQ_MOCK) || defined(INTERACTIVE_MODE)
 #include "common/air.h"
 #include "common/fhss_protocol.h"
 #include "air_mock.h"
 #endif
 
-#if (defined(DEMO_USART_LINK) || defined(STEP3_FHSS_MOCK)) && !defined(STEP2_MOCK_TEST) && !defined(STEP5_FAULT_TEST) && !defined(STEP6_DATA_MOCK) && !defined(STEP7_ARQ_MOCK)
+#if (defined(DEMO_USART_LINK) || defined(STEP3_FHSS_MOCK)) && !defined(STEP2_MOCK_TEST) && !defined(STEP5_FAULT_TEST) && !defined(STEP6_DATA_MOCK) && !defined(STEP7_ARQ_MOCK) && !defined(INTERACTIVE_MODE)
 
 static void log_sync_locked(uint8_t ch, uint32_t delta) {
     char buf[48];
@@ -1955,7 +1958,7 @@ static void step6_data_mock_run(void) {
 }
 #endif
 
-#ifdef STEP7_ARQ_MOCK
+#if defined(STEP7_ARQ_MOCK) || defined(INTERACTIVE_MODE)
 /*
  * Stage 7: Node A DATA Retransmission and ACK-Loss Recovery over USART2 Mock Transport
  *
@@ -2216,28 +2219,23 @@ static step7_ack_status_t step7_wait_ack(uint8_t tuned_ch, uint8_t exp_msg_id,
     return last_status;
 }
 
-static int step7_send_message_arq(const char *text, uint8_t msg_id,
-                                  uint8_t *inout_seq,
-                                  fhss_replay_t *rx_replay,
-                                  step7_msg_report_t *report) {
-    if (text == (const char *)0 || inout_seq == (uint8_t *)0 ||
+static int step7_send_blob_arq(const uint8_t *blob, uint8_t blob_len, uint8_t msg_id,
+                               uint8_t *inout_seq,
+                               fhss_replay_t *rx_replay,
+                               step7_msg_report_t *report) {
+    if (blob == (const uint8_t *)0 || inout_seq == (uint8_t *)0 ||
         rx_replay == (fhss_replay_t *)0 || report == (step7_msg_report_t *)0) {
         return 0;
     }
 
-    uint8_t msg_len = 0U;
-    while (text[msg_len] != '\0') {
-        msg_len++;
-    }
-
-    uint8_t total_frags = (uint8_t)((msg_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+    uint8_t total_frags = (uint8_t)((blob_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
     if (total_frags == 0U) {
         total_frags = 1U;
     }
 
-    report->text = text;
+    report->text = (const char *)blob;
     report->msg_id = msg_id;
-    report->msg_len = msg_len;
+    report->msg_len = blob_len;
     report->total_frags = total_frags;
     report->frags_tx_ok = 0U;
     report->frags_ack_valid = 0U;
@@ -2246,7 +2244,7 @@ static int step7_send_message_arq(const char *text, uint8_t msg_id,
 
     for (uint8_t idx = 0U; idx < total_frags; idx++) {
         uint8_t offset = (uint8_t)(idx * MAX_PAYLOAD);
-        uint8_t rem = (uint8_t)(msg_len - offset);
+        uint8_t rem = (uint8_t)(blob_len - offset);
         uint8_t chunk_len = (rem > MAX_PAYLOAD) ? MAX_PAYLOAD : rem;
         uint8_t last = (idx == (total_frags - 1U)) ? 1U : 0U;
 
@@ -2266,7 +2264,7 @@ static int step7_send_message_arq(const char *text, uint8_t msg_id,
 
             uint8_t tx_frame[MAX_FRAME_LEN];
             uint8_t tx_len = 0U;
-            const uint8_t *payload_ptr = (const uint8_t *)&text[offset];
+            const uint8_t *payload_ptr = &blob[offset];
 
             status_t build_st = fhss_build_data(seq, msg_id, total_frags, idx, last,
                                                 0U, 0U, payload_ptr, chunk_len,
@@ -2356,6 +2354,21 @@ static int step7_send_message_arq(const char *text, uint8_t msg_id,
         return 1;
     }
     return 0;
+}
+
+#if defined(STEP7_ARQ_MOCK)
+static int step7_send_message_arq(const char *text, uint8_t msg_id,
+                                  uint8_t *inout_seq,
+                                  fhss_replay_t *rx_replay,
+                                  step7_msg_report_t *report) {
+    if (text == (const char *)0) {
+        return 0;
+    }
+    uint8_t len = 0U;
+    while (text[len] != '\0') {
+        len++;
+    }
+    return step7_send_blob_arq((const uint8_t *)text, len, msg_id, inout_seq, rx_replay, report);
 }
 
 static void step7_arq_mock_run(void) {
@@ -2483,7 +2496,231 @@ static void step7_arq_mock_run(void) {
         log_line(TAG_BOOT, idle_buf);
     }
 }
-#endif
+#endif /* STEP7_ARQ_MOCK */
+
+#if defined(INTERACTIVE_MODE)
+#define MAX_ENC_PLAINTEXT_LEN 99U
+#define ENC_OVERHEAD_LEN     (1U + CHACHA20_NONCE_LEN + POLY1305_TAG_LEN) /* 29 bytes */
+#define MAX_ENC_PACKET_LEN   (MAX_ENC_PLAINTEXT_LEN + ENC_OVERHEAD_LEN)   /* 128 bytes */
+
+static const uint8_t s_demo_key[CHACHA20_KEY_LEN] = {
+    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF,
+    0xFE, 0xDC, 0xBA, 0x98, 0x76, 0x54, 0x32, 0x10,
+    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+    0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF
+};
+
+static inline void UART1_SendChar(char c) {
+    char s[2];
+    s[0] = c;
+    s[1] = '\0';
+    UART1_SendString(s);
+}
+
+static void UART1_SendHexBytes(const uint8_t *data, size_t len) {
+    static const char hex_chars[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        char h[3];
+        h[0] = hex_chars[(data[i] >> 4) & 0x0FU];
+        h[1] = hex_chars[data[i] & 0x0FU];
+        h[2] = '\0';
+        UART1_SendString(h);
+        if (i + 1 < len) {
+            UART1_SendChar(' ');
+        }
+    }
+}
+
+static int UART1_GetChar(uint8_t *ch) {
+    uint32_t sr = USART1->SR;
+    if (sr & (USART_SR_RXNE | USART_SR_ORE)) {
+        uint8_t dr = (uint8_t)(USART1->DR & 0xFFU);
+        if (sr & USART_SR_RXNE) {
+            if (ch != (uint8_t *)0) {
+                *ch = dr;
+            }
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void interactive_mode_run(void) {
+    UART1_SendString("\r\n====================================\r\n");
+    UART1_SendString(" FHSS COMMUNICATION SYSTEM\r\n");
+    UART1_SendString(" Node A — Transmitter (AEAD Mode)\r\n");
+    UART1_SendString("====================================\r\n\r\n");
+
+    /* Initialize persistent monotonic nonce manager */
+    nonce_mgr_init();
+
+    /* Startup delay to allow Node B to complete initialization */
+    delay_ms(STEP7_STARTUP_DELAY_MS);
+    air_mock_flush();
+    air_mock_clear_diag();
+
+    if (fhss_verify_vectors() == OK) {
+        log_line(TAG_TEST, "vectors PASS");
+    } else {
+        log_line(TAG_TEST, "vectors FAIL");
+        while (1) { __asm__ volatile ("nop"); }
+    }
+
+    uint8_t s_tx_seq = 0U;
+    fhss_replay_t s_rx_replay = {0, 0};
+    uint8_t s_msg_id = 1U;
+
+    char input_buf[MAX_ENC_PLAINTEXT_LEN + 4U];
+    uint32_t input_len = 0U;
+    uint8_t oversized = 0U;
+    uint8_t last_was_cr = 0U;
+
+    UART1_SendString("Enter message: ");
+
+    while (1) {
+        uint8_t c = 0U;
+        if (UART1_GetChar(&c)) {
+            /* Handle CRLF: If previous was CR and current is LF, ignore this LF */
+            if (last_was_cr != 0U && c == '\n') {
+                last_was_cr = 0U;
+                continue;
+            }
+            last_was_cr = (c == '\r') ? 1U : 0U;
+
+            if (c == '\r' || c == '\n') {
+                UART1_SendString("\r\n");
+
+                if (oversized != 0U || input_len > MAX_ENC_PLAINTEXT_LEN) {
+                    log_line("APP", "Message rejected: length exceeds encrypted maximum (99 bytes)");
+                    oversized = 0U;
+                    input_len = 0U;
+                    UART1_SendString("Enter message: ");
+                    continue;
+                }
+
+                if (input_len == 0U) {
+                    log_line("APP", "Empty message rejected");
+                    UART1_SendString("Enter message: ");
+                    continue;
+                }
+
+                input_buf[input_len] = '\0';
+                log_line("APP", "Input accepted");
+
+                /* Print original plaintext per specification */
+                UART1_SendString("[ENC] Original plaintext: ");
+                UART1_SendString(input_buf);
+                UART1_SendString("\r\n");
+
+                /* Obtain next strictly unique 12-byte nonce */
+                uint8_t nonce[CHACHA20_NONCE_LEN];
+                nonce_mgr_get_next(nonce);
+
+                UART1_SendString("[ENC] Nonce (12 bytes): ");
+                UART1_SendHexBytes(nonce, CHACHA20_NONCE_LEN);
+                UART1_SendString("\r\n");
+
+                uint8_t cur_msg_id = s_msg_id++;
+                if (s_msg_id == 0U) {
+                    s_msg_id = 1U;
+                }
+
+                /* Construct Associated Data: exact string "FHSS-APP-ENC-v1" + 1-byte DATA msg_id */
+                uint8_t aad[16];
+                memcpy(aad, "FHSS-APP-ENC-v1", 15);
+                aad[15] = cur_msg_id;
+
+                /* Encrypt plaintext using standard ChaCha20-Poly1305 */
+                uint8_t ciphertext[MAX_ENC_PLAINTEXT_LEN];
+                uint8_t tag[POLY1305_TAG_LEN];
+                aead_chacha20_poly1305_encrypt(
+                    s_demo_key,
+                    nonce,
+                    aad, sizeof(aad),
+                    (const uint8_t *)input_buf, input_len,
+                    ciphertext,
+                    tag
+                );
+
+                /* Print actual ciphertext bytes in hexadecimal */
+                UART1_SendString("[ENC] Ciphertext: ");
+                UART1_SendHexBytes(ciphertext, input_len);
+                UART1_SendString("\r\n");
+
+                /* Print 16-byte Poly1305 authentication tag in hexadecimal */
+                UART1_SendString("[ENC] Poly1305 Tag: ");
+                UART1_SendHexBytes(tag, POLY1305_TAG_LEN);
+                UART1_SendString("\r\n");
+
+                /* Assemble encrypted application message format:
+                 * - byte 0: version 0xE1
+                 * - bytes 1..12: nonce
+                 * - following bytes: ciphertext
+                 * - final 16 bytes: Poly1305 authentication tag
+                 */
+                uint8_t enc_packet[MAX_ENC_PACKET_LEN];
+                enc_packet[0] = ENC_VERSION_BYTE;
+                memcpy(&enc_packet[1], nonce, CHACHA20_NONCE_LEN);
+                memcpy(&enc_packet[1 + CHACHA20_NONCE_LEN], ciphertext, input_len);
+                memcpy(&enc_packet[1 + CHACHA20_NONCE_LEN + input_len], tag, POLY1305_TAG_LEN);
+                uint8_t enc_packet_len = (uint8_t)(1U + CHACHA20_NONCE_LEN + input_len + POLY1305_TAG_LEN);
+
+                char num_buf[48];
+                uint32_t np = 0;
+                step7_append_str(num_buf, sizeof(num_buf), &np, "Encrypted packet size: ");
+                step7_append_u32(num_buf, sizeof(num_buf), &np, (uint32_t)enc_packet_len);
+                step7_append_str(num_buf, sizeof(num_buf), &np, " bytes");
+                log_line("ENC", num_buf);
+
+                uint8_t total_frags = (uint8_t)((enc_packet_len + MAX_PAYLOAD - 1U) / MAX_PAYLOAD);
+                if (total_frags == 0U) {
+                    total_frags = 1U;
+                }
+
+                np = 0;
+                step7_append_str(num_buf, sizeof(num_buf), &np, "Fragments required: ");
+                step7_append_u32(num_buf, sizeof(num_buf), &np, (uint32_t)total_frags);
+                log_line("DATA", num_buf);
+
+                log_line(TAG_ARQ, "Sending message...");
+
+                step7_msg_report_t rep;
+                int res = step7_send_blob_arq(enc_packet, enc_packet_len, cur_msg_id, &s_tx_seq, &s_rx_replay, &rep);
+
+                if (res != 0) {
+                    log_line(TAG_ARQ, "Message transmission result: SUCCESS");
+                } else {
+                    log_line(TAG_ARQ, "Message transmission result: FAILED");
+                }
+
+                input_len = 0U;
+                oversized = 0U;
+                UART1_SendString("Enter message: ");
+            } else if (c == 0x08 || c == 0x7F) {
+                /* Backspace handling */
+                if (input_len > 0U) {
+                    input_len--;
+                    UART1_SendString("\b \b");
+                }
+                if (input_len <= MAX_ENC_PLAINTEXT_LEN) {
+                    oversized = 0U;
+                }
+            } else if (c >= 0x20 && c <= 0x7E) {
+                if (input_len < MAX_ENC_PLAINTEXT_LEN) {
+                    input_buf[input_len++] = (char)c;
+                    UART1_SendChar((char)c);
+                } else {
+                    oversized = 1U;
+                    UART1_SendChar((char)c);
+                }
+            }
+        }
+        __asm__ volatile ("nop");
+    }
+}
+#endif /* INTERACTIVE_MODE */
+
+#endif /* STEP7_ARQ_MOCK || INTERACTIVE_MODE */
 
 /*
  * Node A (Transmitter and Hop Master)
@@ -2492,7 +2729,9 @@ static void step7_arq_mock_run(void) {
 int main(void) {
     baremetal_init();
 
-#if defined(STEP7_ARQ_MOCK)
+#if defined(INTERACTIVE_MODE)
+    interactive_mode_run();
+#elif defined(STEP7_ARQ_MOCK)
     step7_arq_mock_run();
 #elif defined(STEP6_DATA_MOCK)
     step6_data_mock_run();
