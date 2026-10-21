@@ -947,8 +947,638 @@ static void test_step5_fault_test(void) {
     printf("[HOST_TEST] test_step5_fault_test: PASS\n");
 }
 
+#include "step6_data_mock.h"
+#include "step7_arq_mock.h"
+
+static void make_test_data_envelope(
+    uint8_t ch,
+    uint8_t seq,
+    uint8_t msg_id,
+    uint8_t total,
+    uint8_t idx,
+    uint8_t last,
+    const uint8_t *payload,
+    uint8_t payload_len,
+    uint8_t corrupt_env_crc,
+    uint8_t corrupt_tag,
+    uint8_t *env_out,
+    uint16_t *env_len_out
+) {
+    fhss_packet_t p;
+    p.ver_type = (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_DATA);
+    p.seq = seq;
+    p.msg_id = msg_id;
+    p.frag = (uint8_t)(((total - 1) << 5) | (idx << 2) | (last << 1));
+    p.hop_masked = (uint8_t)(0x00 ^ fhss_generate_mask(seq, 0));
+    p.payload_len = payload_len;
+    if (payload != NULL && payload_len > 0) {
+        memcpy(p.payload, payload, payload_len);
+    }
+    uint8_t wire[32];
+    uint8_t wire_len = 0;
+    assert(fhss_build_packet(&p, wire, &wire_len) == OK);
+    if (corrupt_tag) {
+        wire[5] ^= 0xA5;
+    }
+    env_out[0] = 0x7E;
+    env_out[1] = ch;
+    env_out[2] = wire_len;
+    memcpy(&env_out[3], wire, wire_len);
+    uint8_t crc = crc8_smbus_cont(&env_out[1], (uint8_t)(2 + wire_len), CRC8_SMBUS_INIT);
+    if (corrupt_env_crc) {
+        crc ^= 0x55;
+    }
+    env_out[3 + wire_len] = crc;
+    *env_len_out = (uint16_t)(4 + wire_len);
+}
+
+static void test_step6_data_mock(void) {
+    step6_harness_t harness;
+    step6_harness_init(&harness);
+    assert(harness.target_messages == 2);
+    assert(harness.completed_messages == 0);
+    assert(harness.cycle_done == 0);
+
+    fhss_packet_t ack;
+    uint8_t tx_ch = 0;
+    fhss_packet_t rx_pkt;
+    uint8_t env[48];
+    uint16_t env_len = 0;
+    step6_rx_outcome_t outcome;
+    uint16_t avail = 0;
+
+    /* =========================================================================
+     * 1. Message 1: Single-fragment ASCII message (TOTAL=1, IDX=0, LAST=1)
+     * ========================================================================= */
+    const char msg1_text[] = "PING_STAGE6";
+    uint8_t msg1_len = (uint8_t)strlen(msg1_text);
+    mock_rx_reset();
+    make_test_data_envelope(
+        0, 1 /* seq */, 1 /* msg_id */, 1 /* total */, 0 /* idx */, 1 /* last */,
+        (const uint8_t *)msg1_text, msg1_len, 0, 0, env, &env_len
+    );
+    mock_rx_push(env, env_len);
+
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP6_RX_PASS_MSG_COMPLETE);
+    assert(harness.completed_messages == 1);
+    assert(harness.last_completed.msg_id == 1);
+    assert(harness.last_completed.total_len == msg1_len);
+    assert(strcmp((char *)harness.last_completed.data, msg1_text) == 0);
+    assert(ack.ver_type == (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_ACK));
+    assert(ack.msg_id == 1);
+    assert(ack.frag == 0x00); /* (1 - 1) << 5 = 0 */
+    assert(ack.payload[0] == 0x01); /* Bitmap: bit 0 */
+    assert(harness.cycle_done == 0);
+
+    /* =========================================================================
+     * 2. Message 2: Multi-fragment ASCII message (TOTAL=3, 40 bytes)
+     * Frag 0: "0123456789ABCDEF" (16B, idx=0, last=0)
+     * Frag 1: "GHIJKLMNOPQRSTUV" (16B, idx=1, last=0)
+     * Frag 2: "WXYZ1234"         (8B,  idx=2, last=1)
+     * Reconstructed: "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ1234" (40 bytes)
+     * ========================================================================= */
+    const char f0_data[] = "0123456789ABCDEF";
+    const char f1_data[] = "GHIJKLMNOPQRSTUV";
+    const char f2_data[] = "WXYZ1234";
+
+    /* Frag 0 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 2, 3, 0, 0, (const uint8_t *)f0_data, 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP6_RX_PASS_FRAG);
+    assert(ack.payload[0] == 0x01); /* Bitmap: bit 0 */
+    assert(harness.completed_messages == 1);
+
+    /* Frag 1 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 2, 3, 1, 0, (const uint8_t *)f1_data, 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP6_RX_PASS_FRAG);
+    assert(ack.payload[0] == 0x03); /* Bitmap: bits 0, 1 */
+    assert(harness.completed_messages == 1);
+
+    /* Frag 2 (final fragment) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 4, 2, 3, 2, 1, (const uint8_t *)f2_data, 8, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP6_RX_PASS_MSG_COMPLETE);
+    assert(ack.payload[0] == 0x07); /* Bitmap: bits 0, 1, 2 */
+    assert(harness.completed_messages == 2);
+    assert(harness.last_completed.msg_id == 2);
+    assert(harness.last_completed.total_len == 40);
+    assert(memcmp(harness.last_completed.data, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ1234", 40) == 0);
+    assert(harness.last_completed.data[40] == '\0');
+    assert(harness.cycle_done == 1); /* Both messages complete! */
+
+    /* =========================================================================
+     * 3. One-Shot Idle Behavior: After 2 messages complete, subsequent frames are ignored
+     * ========================================================================= */
+    mock_rx_reset();
+    make_test_data_envelope(0, 5, 3, 1, 0, 1, (const uint8_t *)"EXTRA", 5, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(
+        &harness, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt
+    );
+    assert(outcome == STEP6_RX_IDLE);
+    assert(harness.completed_messages == 2);
+
+    /* =========================================================================
+     * 4. Fragment Ordering and LAST Semantics (Out-of-order reassembly)
+     * Frag 1 arrives first, then Frag 2, then Frag 0 last.
+     * ========================================================================= */
+    step6_harness_t h_ooo;
+    step6_harness_init(&h_ooo);
+
+    /* Frag 1 arrives first */
+    mock_rx_reset();
+    make_test_data_envelope(0, 10, 5, 3, 1, 0, (const uint8_t *)f1_data, 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_ooo, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_FRAG);
+    assert(ack.payload[0] == 0x02); /* Bit 1 */
+
+    /* Frag 2 arrives next */
+    mock_rx_reset();
+    make_test_data_envelope(0, 11, 5, 3, 2, 1, (const uint8_t *)f2_data, 8, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_ooo, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_FRAG);
+    assert(ack.payload[0] == 0x06); /* Bits 1, 2 */
+
+    /* Frag 0 arrives last */
+    mock_rx_reset();
+    make_test_data_envelope(0, 12, 5, 3, 0, 0, (const uint8_t *)f0_data, 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_ooo, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_MSG_COMPLETE);
+    assert(ack.payload[0] == 0x07); /* Bits 0, 1, 2 */
+    assert(h_ooo.last_completed.total_len == 40);
+    assert(memcmp(h_ooo.last_completed.data, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ1234", 40) == 0);
+
+    /* =========================================================================
+     * 5. Duplicate Fragment Handling (Fresh Sequence Number on ARQ Retry)
+     * ========================================================================= */
+    step6_harness_t h_dup;
+    step6_harness_init(&h_dup);
+
+    /* Send Frag 0 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 1, 7, 2, 0, 0, (const uint8_t *)"FIRST_HALF______", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_dup, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_FRAG);
+    assert(ack.payload[0] == 0x01);
+
+    /* Retransmit Frag 0 with fresh sequence 2 (e.g. ACK was lost on previous attempt) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 7, 2, 0, 0, (const uint8_t *)"FIRST_HALF______", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_dup, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_DUPLICATE_FRAG);
+    assert(ack.payload[0] == 0x01); /* Responds with cumulative bitmap */
+    assert(h_dup.rx_dup_frag_count == 1);
+
+    /* Send Frag 1 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 7, 2, 1, 1, (const uint8_t *)"SECOND_HALF_____", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_dup, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_MSG_COMPLETE);
+    assert(ack.payload[0] == 0x03);
+
+    /* =========================================================================
+     * 6. Replay Rejection (Same sequence number sent twice)
+     * ========================================================================= */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3 /* same seq as above */, 7, 2, 1, 1, (const uint8_t *)"SECOND_HALF_____", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_dup, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_REJECT_REPLAY);
+    assert(h_dup.proto_replay_count == 1);
+
+    /* =========================================================================
+     * 7. Invalid Metadata: idx >= total, total changed mid-message
+     * ========================================================================= */
+    step6_harness_t h_meta;
+    step6_harness_init(&h_meta);
+
+    /* idx=2, total=2 (idx must be < total) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 1, 9, 2, 2, 1, (const uint8_t *)"BAD", 3, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_meta, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_REJECT_METADATA);
+    assert(h_meta.proto_metadata_count == 1);
+
+    /* Send valid frag 0 with total=2 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 9, 2, 0, 0, (const uint8_t *)"VALID_PART_ONE__", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_meta, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_FRAG);
+
+    /* Send frag 1 with total=3 (changed total mid-message) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 9, 3, 1, 0, (const uint8_t *)"CHANGED_TOTAL___", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_meta, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_REJECT_METADATA);
+
+    /* Recovery: send valid frag 1 with total=2 -> completes message */
+    mock_rx_reset();
+    make_test_data_envelope(0, 4, 9, 2, 1, 1, (const uint8_t *)"VALID_PART_TWO__", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_meta, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_MSG_COMPLETE);
+    assert(h_meta.completed_messages == 1);
+
+    /* =========================================================================
+     * 8. Exact Physical Node A Test Vectors:
+     * Msg 1: "HELLO_NODE_B" (12B, seq=0, id=1, total=1, idx=0, last=1)
+     * Msg 2: "FHSS_DATA_TRANSPORT_TEST_PACKET_#2" (34B, id=2, total=3)
+     *   Frag 0: "FHSS_DATA_TRANSP" (16B, seq=1, idx=0, last=0)
+     *   Frag 1: "ORT_TEST_PACKET_" (16B, seq=2, idx=1, last=0)
+     *   Frag 2: "#2"               (2B,  seq=3, idx=2, last=1)
+     * ========================================================================= */
+    step6_harness_t h_phys;
+    step6_harness_init(&h_phys);
+
+    /* Node A Msg 1 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 0, 1, 1, 0, 1, (const uint8_t *)"HELLO_NODE_B", 12, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_phys, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_MSG_COMPLETE);
+    assert(h_phys.completed_messages == 1);
+    assert(h_phys.last_completed.total_len == 12);
+    assert(strcmp((char *)h_phys.last_completed.data, "HELLO_NODE_B") == 0);
+    assert(ack.payload[0] == 0x01);
+
+    /* Node A Msg 2 Frag 0 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 1, 2, 3, 0, 0, (const uint8_t *)"FHSS_DATA_TRANSP", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_phys, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_FRAG);
+    assert(ack.payload[0] == 0x01);
+
+    /* Node A Msg 2 Frag 1 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 2, 3, 1, 0, (const uint8_t *)"ORT_TEST_PACKET_", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_phys, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_FRAG);
+    assert(ack.payload[0] == 0x03);
+
+    /* Node A Msg 2 Frag 2 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 2, 3, 2, 1, (const uint8_t *)"#2", 2, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step6_harness_process_incoming(&h_phys, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP6_RX_PASS_MSG_COMPLETE);
+    assert(h_phys.completed_messages == 2);
+    assert(h_phys.last_completed.total_len == 34);
+    assert(strcmp((char *)h_phys.last_completed.data, "FHSS_DATA_TRANSPORT_TEST_PACKET_#2") == 0);
+    assert(ack.payload[0] == 0x07);
+    assert(h_phys.cycle_done == 1);
+
+    printf("[HOST_TEST] test_step6_data_mock: PASS\n");
+}
+
+static void test_step7_arq_mock(void) {
+    /* =========================================================================
+     * 1. Exact Coordinated Test Schedule from Section 3:
+     * - Clean boot
+     * - DATA seq 0: Msg 1, frag 0/1 ("HELLO_NODE_B", 12B) -> Accept, reassemble, ACK bitmap 0x01
+     * - DATA seq 1: Msg 2, frag 0/3 ("FHSS_DATA_TRANSP", 16B) -> Accept, ACK bitmap 0x01
+     * - DATA seq 2: Msg 2, frag 1/3 ("ORT_TEST_PACKET_", 16B), 1st try -> Accept, ACK suppressed
+     * - DATA seq 3: Msg 2, frag 1/3 ("ORT_TEST_PACKET_", 16B), retry -> Duplicate, ACK bitmap 0x03
+     * - DATA seq 4: Msg 2, frag 2/3 ("#2", 2B) -> Accept, ACK bitmap 0x07, complete 34-byte message
+     * ========================================================================= */
+    step7_harness_t h_sched;
+    step7_harness_init(&h_sched);
+    assert(h_sched.target_messages == 2);
+    assert(h_sched.completed_messages == 0);
+    assert(h_sched.cycle_done == 0);
+    assert(h_sched.b_seq == 0);
+
+    fhss_packet_t ack;
+    uint8_t tx_ch = 0;
+    fhss_packet_t rx_pkt;
+    uint8_t env[48];
+    uint16_t env_len = 0;
+    step7_rx_outcome_t outcome;
+    uint16_t avail = 0;
+
+    /* Packet 0: DATA seq 0, Msg 1, frag 0/1 ("HELLO_NODE_B", 12 bytes) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 0, 1, 1, 0, 1, (const uint8_t *)"HELLO_NODE_B", 12, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_sched, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_MSG_COMPLETE);
+    assert(h_sched.completed_messages == 1);
+    assert(h_sched.last_completed.total_len == 12);
+    assert(strcmp((char *)h_sched.last_completed.data, "HELLO_NODE_B") == 0);
+    assert(ack.ver_type == (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_ACK));
+    assert(ack.seq == 0);
+    assert(ack.msg_id == 1);
+    assert(ack.payload[0] == 0x01); /* Bitmap: bit 0 */
+    assert(h_sched.b_seq == 1);     /* Sequence incremented for sent ACK */
+    assert(h_sched.tx_ack_count == 1);
+    assert(h_sched.ack_suppressed_count == 0);
+
+    /* Packet 1: DATA seq 1, Msg 2, frag 0/3 ("FHSS_DATA_TRANSP", 16 bytes) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 1, 2, 3, 0, 0, (const uint8_t *)"FHSS_DATA_TRANSP", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_sched, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_FRAG);
+    assert(ack.seq == 1);
+    assert(ack.msg_id == 2);
+    assert(ack.payload[0] == 0x01); /* Bitmap: bit 0 */
+    assert(h_sched.b_seq == 2);
+    assert(h_sched.tx_ack_count == 2);
+    assert(h_sched.ack_suppressed_count == 0);
+
+    /* Packet 2: DATA seq 2, Msg 2, frag 1/3 ("ORT_TEST_PACKET_", 16 bytes), first attempt */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 2, 3, 1, 0, (const uint8_t *)"ORT_TEST_PACKET_", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_sched, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_FRAG_ACK_SUPPRESSED);
+    assert(h_sched.reasm.rx_bitmap == 0x03); /* Bits 0 and 1 recorded */
+    assert(h_sched.ack_suppressed_count == 1);
+    assert(h_sched.ack_suppressed_once == 1);
+    assert(h_sched.b_seq == 2);        /* Node B sequence NOT incremented for suppressed ACK */
+    assert(h_sched.tx_ack_count == 2); /* No ACK transmitted */
+
+    /* Packet 3: DATA seq 3, Msg 2, frag 1/3 ("ORT_TEST_PACKET_", 16 bytes), retransmission */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 2, 3, 1, 0, (const uint8_t *)"ORT_TEST_PACKET_", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_sched, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_DUPLICATE_FRAG);
+    assert(h_sched.rx_dup_frag_count == 1);
+    /* Retransmission recognized with fresh sequence, payload not corrupted */
+    assert(memcmp(&h_sched.reasm.data[16], "ORT_TEST_PACKET_", 16) == 0);
+    assert(ack.seq == 2);           /* Contiguous outgoing ACK sequence (2 follows 1) */
+    assert(ack.msg_id == 2);
+    assert(ack.payload[0] == 0x03); /* Cumulative bitmap */
+    assert(h_sched.b_seq == 3);
+    assert(h_sched.tx_ack_count == 3);
+
+    /* Packet 4: DATA seq 4, Msg 2, frag 2/3 ("#2", 2 bytes), final fragment */
+    mock_rx_reset();
+    make_test_data_envelope(0, 4, 2, 3, 2, 1, (const uint8_t *)"#2", 2, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_sched, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_MSG_COMPLETE);
+    assert(h_sched.completed_messages == 2);
+    assert(h_sched.cycle_done == 1);
+    assert(h_sched.last_completed.total_len == 34);
+    assert(strcmp((char *)h_sched.last_completed.data, "FHSS_DATA_TRANSPORT_TEST_PACKET_#2") == 0);
+    assert(ack.seq == 3);           /* Contiguous outgoing ACK sequence (3 follows 2) */
+    assert(ack.msg_id == 2);
+    assert(ack.payload[0] == 0x07); /* Cumulative bitmap bits 0, 1, 2 */
+    assert(h_sched.b_seq == 4);
+    assert(h_sched.tx_ack_count == 4);
+
+    /* Verify all counters for the successful session */
+    assert(h_sched.rx_total_count == 5);
+    assert(h_sched.rx_frag_count == 4);
+    assert(h_sched.rx_dup_frag_count == 1);
+    assert(h_sched.tx_ack_count == 4);
+    assert(h_sched.ack_suppressed_count == 1);
+    assert(h_sched.completed_messages == 2);
+    assert(h_sched.proto_replay_count == 0);
+    assert(h_sched.proto_bad_tag_count == 0);
+    assert(h_sched.env_crc_err_count == 0);
+    assert(h_sched.env_len_err_count == 0);
+    assert(h_sched.env_ch_err_count == 0);
+    assert(h_sched.proto_wrong_ch_count == 0);
+    assert(h_sched.proto_non_data_count == 0);
+    assert(h_sched.proto_metadata_count == 0);
+    assert(h_sched.proto_conflict_count == 0);
+
+    /* Verify idle behavior once session is complete */
+    mock_rx_reset();
+    make_test_data_envelope(0, 5, 3, 1, 0, 1, (const uint8_t *)"EXTRA", 5, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_sched, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_IDLE);
+
+    /* =========================================================================
+     * 2. Conflicting Duplicate Fragment Rejection (Section 4, Rule 8):
+     * Repeated logical fragment with conflicting payload or metadata must NOT
+     * overwrite already accepted data or be ACKed as an identical duplicate.
+     * ========================================================================= */
+    step7_harness_t h_conflict;
+    step7_harness_init(&h_conflict);
+
+    /* Valid Frag 0 of Msg 5 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 1, 5, 2, 0, 0, (const uint8_t *)"VALID_PAYLOAD_00", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_conflict, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_FRAG);
+    assert(h_conflict.reasm.rx_bitmap == 0x01);
+    assert(h_conflict.tx_ack_count == 1);
+    assert(h_conflict.b_seq == 1);
+
+    /* Duplicate Frag 0 with fresh sequence 2, but conflicting payload bytes */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 5, 2, 0, 0, (const uint8_t *)"CORRUPT_PAYLOAD!", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_conflict, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_REJECT_CONFLICT);
+    assert(h_conflict.proto_conflict_count == 1);
+    /* Accepted data must NOT be overwritten */
+    assert(memcmp(&h_conflict.reasm.data[0], "VALID_PAYLOAD_00", 16) == 0);
+    assert(h_conflict.tx_ack_count == 1); /* No ACK sent */
+    assert(h_conflict.b_seq == 1);        /* b_seq unchanged */
+
+    /* Duplicate Frag 0 with fresh sequence 3, but conflicting payload length */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 5, 2, 0, 0, (const uint8_t *)"SHORT", 5, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_conflict, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_REJECT_CONFLICT);
+    assert(h_conflict.proto_conflict_count == 2);
+    assert(memcmp(&h_conflict.reasm.data[0], "VALID_PAYLOAD_00", 16) == 0);
+    assert(h_conflict.tx_ack_count == 1);
+
+    /* Duplicate Frag 0 with fresh sequence 4 and exact matching payload */
+    mock_rx_reset();
+    make_test_data_envelope(0, 4, 5, 2, 0, 0, (const uint8_t *)"VALID_PAYLOAD_00", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_conflict, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_DUPLICATE_FRAG);
+    assert(h_conflict.rx_dup_frag_count == 1);
+    assert(ack.seq == 1);
+    assert(ack.payload[0] == 0x01);
+    assert(h_conflict.tx_ack_count == 2);
+    assert(h_conflict.b_seq == 2);
+
+    /* Complete message with valid Frag 1 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 5, 5, 2, 1, 1, (const uint8_t *)"VALID_PART_TWO__", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_conflict, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_MSG_COMPLETE);
+    assert(h_conflict.completed_messages == 1);
+    assert(h_conflict.last_completed.total_len == 32);
+    assert(memcmp(h_conflict.last_completed.data, "VALID_PAYLOAD_00VALID_PART_TWO__", 32) == 0);
+
+    /* =========================================================================
+     * 3. Replay Protection Preservation (Section 4, Rule 9):
+     * Sequence 3 is recognized as a fresh retry, while actual packet-level replays
+     * (diff == 0 or diff > 127) are strictly rejected.
+     * ========================================================================= */
+    step7_harness_t h_rep;
+    step7_harness_init(&h_rep);
+
+    /* Send Frag 0 with seq 10 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 10, 8, 2, 0, 0, (const uint8_t *)"SAMPLE_DATA_AAAA", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_rep, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_FRAG);
+    assert(h_rep.last_seq == 10);
+
+    /* Packet-level replay: same sequence 10 sent again -> ERR_REPLAY */
+    mock_rx_reset();
+    make_test_data_envelope(0, 10, 8, 2, 0, 0, (const uint8_t *)"SAMPLE_DATA_AAAA", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_rep, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_REJECT_REPLAY);
+    assert(h_rep.proto_replay_count == 1);
+
+    /* Older sequence 9 -> ERR_REPLAY */
+    mock_rx_reset();
+    make_test_data_envelope(0, 9, 8, 2, 0, 0, (const uint8_t *)"SAMPLE_DATA_AAAA", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_rep, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_REJECT_REPLAY);
+    assert(h_rep.proto_replay_count == 2);
+
+    /* Fresh sequence 11 with same logical fragment -> DUPLICATE_FRAG (NOT replay) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 11, 8, 2, 0, 0, (const uint8_t *)"SAMPLE_DATA_AAAA", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_rep, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_DUPLICATE_FRAG);
+    assert(h_rep.last_seq == 11);
+    assert(h_rep.proto_replay_count == 2); /* No replay error counted for fresh sequence! */
+
+    /* Replaying sequence 10 now -> ERR_REPLAY */
+    mock_rx_reset();
+    make_test_data_envelope(0, 10, 8, 2, 0, 0, (const uint8_t *)"SAMPLE_DATA_AAAA", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_rep, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_REJECT_REPLAY);
+    assert(h_rep.proto_replay_count == 3);
+
+    /* =========================================================================
+     * 4. One-Shot Suppression Specificity (Section 4, Rule 6):
+     * Suppression rule must ONLY trigger on Msg 2 Frag 1, exactly once.
+     * ========================================================================= */
+    step7_harness_t h_spec;
+    step7_harness_init(&h_spec);
+
+    /* Msg 3, Frag 1/3: Not Msg ID 2 -> ACK NOT suppressed */
+    mock_rx_reset();
+    make_test_data_envelope(0, 1, 3, 3, 1, 0, (const uint8_t *)"PART_ONE________", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_spec, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_FRAG);
+    assert(h_spec.ack_suppressed_count == 0);
+    assert(h_spec.tx_ack_count == 1);
+
+    /* Msg 2, Frag 0/3: Frag index 0 -> ACK NOT suppressed */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 2, 3, 0, 0, (const uint8_t *)"PART_ZERO_______", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_spec, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_FRAG);
+    assert(h_spec.ack_suppressed_count == 0);
+    assert(h_spec.tx_ack_count == 2);
+
+    /* Msg 2, Frag 1/3: Frag index 1 -> ACK SUPPRESSED! */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 2, 3, 1, 0, (const uint8_t *)"PART_ONE________", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_spec, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_PASS_FRAG_ACK_SUPPRESSED);
+    assert(h_spec.ack_suppressed_count == 1);
+    assert(h_spec.ack_suppressed_once == 1);
+    assert(h_spec.tx_ack_count == 2);
+
+    /* Msg 2, Frag 1/3 retry: Duplicate recognized -> ACK NOT suppressed! */
+    mock_rx_reset();
+    make_test_data_envelope(0, 4, 2, 3, 1, 0, (const uint8_t *)"PART_ONE________", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = step7_harness_process_incoming(&h_spec, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == STEP7_RX_DUPLICATE_FRAG);
+    assert(h_spec.ack_suppressed_count == 1); /* Still 1 */
+    assert(h_spec.tx_ack_count == 3);
+
+    printf("[HOST_TEST] test_step7_arq_mock: PASS\n");
+}
+
 int main(void) {
-    printf("--- Running Node B Host Tests (Step B0, B2, Step 1, Stage 2, Stage 3, Stage 4 & Stage 5) ---\n");
+    printf("--- Running Node B Host Tests (Step B0, B2, Step 1, Stage 2, Stage 3, Stage 4, Stage 5, Stage 6 & Stage 7) ---\n");
     test_status_strings();
     test_channel_plan();
     test_log_formatter();
@@ -959,6 +1589,8 @@ int main(void) {
     test_step3_state_machine();
     test_step4_spi_diag();
     test_step5_fault_test();
+    test_step6_data_mock();
+    test_step7_arq_mock();
     printf("--- All Host Tests Passed ---\n");
     return 0;
 }

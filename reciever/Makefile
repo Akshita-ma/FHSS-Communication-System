@@ -38,6 +38,8 @@ OBJS        = $(BUILD_DIR)/status.o \
               $(BUILD_DIR)/step3_fhss_mock.o \
               $(BUILD_DIR)/step4_radio_spi_diag.o \
               $(BUILD_DIR)/step5_fault_test.o \
+              $(BUILD_DIR)/step6_data_mock.o \
+              $(BUILD_DIR)/step7_arq_mock.o \
               $(BUILD_DIR)/node_b_rx.o
 
 # Host test sources
@@ -51,12 +53,14 @@ HOST_SRCS   = ../common/status.c \
               node_b_f4/step3_fhss_mock.c \
               node_b_f4/step4_radio_spi_diag.c \
               node_b_f4/step5_fault_test.c \
+              node_b_f4/step6_data_mock.c \
+              node_b_f4/step7_arq_mock.c \
               tests/host/mock_hal.c \
               tests/host/test_b0_host.c
 
 HOST_CFLAGS = -Wall -Wextra -Werror -I../common -Itests/host -Inode_b_f4 -DHOST_TEST
 
-.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock step3_fhss_mock step3-fhss-mock flash_step3 flash_step3_mock step4_radio_spi_diag step4-radio-spi-diag flash_step4 flash_step4_radio_spi_diag step5_fault_test step5-fault-test flash_step5 flash_step5_fault_test
+.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock step3_fhss_mock step3-fhss-mock flash_step3 flash_step3_mock step4_radio_spi_diag step4-radio-spi-diag flash_step4 flash_step4_radio_spi_diag step5_fault_test step5-fault-test flash_step5 flash_step5_fault_test step6_data_mock step6-data-mock flash_step6 flash_step6_data_mock step7_arq_mock step7-arq-mock flash_step7 flash_step7_arq_mock
 
 step1-uart-test: CFLAGS += -DSTEP1_UART_TEST
 step1-uart-test: clean
@@ -133,6 +137,38 @@ flash_step5: step5_fault_test
 	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step5_fault_test.elf verify reset exit"
 
 flash_step5_fault_test: flash_step5
+
+step6_data_mock: CFLAGS += -DSTEP6_DATA_MOCK
+step6_data_mock: clean
+	@$(MAKE) $(BUILD_DIR)/step6_data_mock.elf $(BUILD_DIR)/step6_data_mock.bin $(BUILD_DIR)/step6_data_mock.hex TARGET=step6_data_mock CFLAGS="$(CFLAGS) -DSTEP6_DATA_MOCK"
+	@cp -f $(BUILD_DIR)/step6_data_mock.elf $(BUILD_DIR)/$(ALT_TARGET).elf 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step6_data_mock.bin $(BUILD_DIR)/$(ALT_TARGET).bin 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step6_data_mock.hex $(BUILD_DIR)/$(ALT_TARGET).hex 2>/dev/null || true
+	@echo "--- Step 6 DATA Mock Build complete ---"
+	$(SIZE) $(BUILD_DIR)/step6_data_mock.elf
+
+step6-data-mock: step6_data_mock
+
+flash_step6: step6_data_mock
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step6_data_mock.elf verify reset exit"
+
+flash_step6_data_mock: flash_step6
+
+step7_arq_mock: CFLAGS += -DSTEP7_ARQ_MOCK
+step7_arq_mock: clean
+	@$(MAKE) $(BUILD_DIR)/step7_arq_mock.elf $(BUILD_DIR)/step7_arq_mock.bin $(BUILD_DIR)/step7_arq_mock.hex TARGET=step7_arq_mock CFLAGS="$(CFLAGS) -DSTEP7_ARQ_MOCK"
+	@cp -f $(BUILD_DIR)/step7_arq_mock.elf $(BUILD_DIR)/$(ALT_TARGET).elf 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step7_arq_mock.bin $(BUILD_DIR)/$(ALT_TARGET).bin 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/step7_arq_mock.hex $(BUILD_DIR)/$(ALT_TARGET).hex 2>/dev/null || true
+	@echo "--- Step 7 ARQ Mock Build complete ---"
+	$(SIZE) $(BUILD_DIR)/step7_arq_mock.elf
+
+step7-arq-mock: step7_arq_mock
+
+flash_step7: step7_arq_mock
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step7_arq_mock.elf verify reset exit"
+
+flash_step7_arq_mock: flash_step7
 
 demo: CFLAGS += -DDEMO_USART_LINK -DDEMO_TRACE
 ifeq ($(RF_KEYING),1)
