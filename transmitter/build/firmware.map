@@ -1,0 +1,270 @@
+
+Discarded input sections
+
+ .text          0x00000000        0x0 build/status.o
+ .data          0x00000000        0x0 build/status.o
+ .bss           0x00000000        0x0 build/status.o
+ .rodata.status_to_string.str1.1
+                0x00000000        0xc build/status.o
+ .text.status_to_string
+                0x00000000       0x18 build/status.o
+ .rodata.str1.1
+                0x00000000       0x60 build/status.o
+ .rodata.CSWTCH.1
+                0x00000000       0x2c build/status.o
+ .comment       0x00000000       0x24 build/status.o
+ .ARM.attributes
+                0x00000000       0x2d build/status.o
+ .text          0x00000000        0x0 build/config.o
+ .data          0x00000000        0x0 build/config.o
+ .bss           0x00000000        0x0 build/config.o
+ .text.config_get_channel_frf
+                0x00000000       0x20 build/config.o
+ .text.config_get_channel_bytes
+                0x00000000       0x30 build/config.o
+ .rodata.g_channel_table
+                0x00000000       0x80 build/config.o
+ .comment       0x00000000       0x24 build/config.o
+ .ARM.attributes
+                0x00000000       0x2d build/config.o
+ .text          0x00000000        0x0 build/log.o
+ .data          0x00000000        0x0 build/log.o
+ .bss           0x00000000        0x0 build/log.o
+ .rodata.Log_Test.str1.1
+                0x00000000       0x18 build/log.o
+ .text.Log_Test
+                0x00000000       0x30 build/log.o
+ .rodata.Log_Uint.str1.1
+                0x00000000        0x5 build/log.o
+ .text.Log_Uint
+                0x00000000       0x8c build/log.o
+ .rodata.Log_Hex.str1.1
+                0x00000000       0x11 build/log.o
+ .text.Log_Hex  0x00000000       0xd0 build/log.o
+ .comment       0x00000000       0x24 build/log.o
+ .ARM.attributes
+                0x00000000       0x2d build/log.o
+ .text          0x00000000        0x0 build/sx1278_fsk.o
+ .data          0x00000000        0x0 build/sx1278_fsk.o
+ .bss           0x00000000        0x0 build/sx1278_fsk.o
+ .text.sx1278_read_reg
+                0x00000000       0x40 build/sx1278_fsk.o
+ .text.sx1278_write_reg
+                0x00000000       0x3a build/sx1278_fsk.o
+ .text.sx1278_reset
+                0x00000000       0x1e build/sx1278_fsk.o
+ .comment       0x00000000       0x24 build/sx1278_fsk.o
+ .ARM.attributes
+                0x00000000       0x2d build/sx1278_fsk.o
+ .text          0x00000000        0x0 build/startup_f103.o
+ .data          0x00000000        0x0 build/startup_f103.o
+ .bss           0x00000000        0x0 build/startup_f103.o
+ .comment       0x00000000       0x24 build/startup_f103.o
+ .ARM.attributes
+                0x00000000       0x2d build/startup_f103.o
+ .text          0x00000000        0x0 build/stm32_baremetal.o
+ .data          0x00000000        0x0 build/stm32_baremetal.o
+ .bss           0x00000000        0x0 build/stm32_baremetal.o
+ .text.NSS_LOW  0x00000000       0x10 build/stm32_baremetal.o
+ .text.NSS_HIGH
+                0x00000000        0xc build/stm32_baremetal.o
+ .text.SPI1_Transfer
+                0x00000000       0x5c build/stm32_baremetal.o
+ .text.TIM2_ScheduleHopMs
+                0x00000000       0x64 build/stm32_baremetal.o
+ .text.Radio_Reset_Pin
+                0x00000000       0x14 build/stm32_baremetal.o
+ .text.millis   0x00000000        0xc build/stm32_baremetal.o
+ .text.EXTI0_RegisterCallback
+                0x00000000       0x14 build/stm32_baremetal.o
+ .comment       0x00000000       0x24 build/stm32_baremetal.o
+ .ARM.attributes
+                0x00000000       0x2d build/stm32_baremetal.o
+ .text          0x00000000        0x0 build/node_a_tx.o
+ .data          0x00000000        0x0 build/node_a_tx.o
+ .bss           0x00000000        0x0 build/node_a_tx.o
+ .comment       0x00000000       0x24 build/node_a_tx.o
+ .ARM.attributes
+                0x00000000       0x2d build/node_a_tx.o
+
+Memory Configuration
+
+Name             Origin             Length             Attributes
+FLASH            0x08000000         0x00010000         xr
+RAM              0x20000000         0x00005000         rw
+*default*        0x00000000         0xffffffff
+
+Linker script and memory map
+
+LOAD build/status.o
+LOAD build/config.o
+LOAD build/log.o
+LOAD build/sx1278_fsk.o
+LOAD build/startup_f103.o
+LOAD build/stm32_baremetal.o
+LOAD build/node_a_tx.o
+START GROUP
+LOAD /usr/lib/gcc/arm-none-eabi/15.2.0/thumb/v7-m/nofp/libgcc.a
+LOAD /usr/lib/gcc/arm-none-eabi/15.2.0/../../../../arm-none-eabi/lib/thumb/v7-m/nofp/libc.a
+END GROUP
+                0x20005000                        _estack = 0x20005000
+
+.isr_vector     0x08000000       0xec
+                0x08000000                        . = ALIGN (0x4)
+ *(.isr_vector)
+ .isr_vector    0x08000000       0xec build/startup_f103.o
+                0x08000000                g_pfnVectors
+                0x080000ec                        . = ALIGN (0x4)
+
+.text           0x080000ec      0x478
+                0x080000ec                        . = ALIGN (0x4)
+ *(.text)
+ *(.text*)
+ .text.Log_Msg  0x080000ec       0x44 build/log.o
+                0x080000ec                Log_Msg
+ .text.Default_Handler
+                0x08000130        0x2 build/startup_f103.o
+                0x08000130                RTC_Alarm_IRQHandler
+                0x08000130                EXTI2_IRQHandler
+                0x08000130                DebugMon_Handler
+                0x08000130                TIM1_CC_IRQHandler
+                0x08000130                HardFault_Handler
+                0x08000130                PVD_IRQHandler
+                0x08000130                PendSV_Handler
+                0x08000130                NMI_Handler
+                0x08000130                EXTI3_IRQHandler
+                0x08000130                I2C2_EV_IRQHandler
+                0x08000130                UsageFault_Handler
+                0x08000130                ADC1_2_IRQHandler
+                0x08000130                SPI1_IRQHandler
+                0x08000130                TAMPER_IRQHandler
+                0x08000130                DMA1_Channel4_IRQHandler
+                0x08000130                USART3_IRQHandler
+                0x08000130                RTC_IRQHandler
+                0x08000130                DMA1_Channel7_IRQHandler
+                0x08000130                CAN1_RX1_IRQHandler
+                0x08000130                TIM4_IRQHandler
+                0x08000130                I2C1_EV_IRQHandler
+                0x08000130                DMA1_Channel6_IRQHandler
+                0x08000130                TIM3_IRQHandler
+                0x08000130                RCC_IRQHandler
+                0x08000130                TIM1_TRG_COM_IRQHandler
+                0x08000130                DMA1_Channel1_IRQHandler
+                0x08000130                Default_Handler
+                0x08000130                EXTI15_10_IRQHandler
+                0x08000130                EXTI9_5_IRQHandler
+                0x08000130                SPI2_IRQHandler
+                0x08000130                MemManage_Handler
+                0x08000130                SVC_Handler
+                0x08000130                DMA1_Channel5_IRQHandler
+                0x08000130                EXTI4_IRQHandler
+                0x08000130                USB_LP_CAN1_RX0_IRQHandler
+                0x08000130                USB_HP_CAN1_TX_IRQHandler
+                0x08000130                DMA1_Channel3_IRQHandler
+                0x08000130                TIM1_UP_IRQHandler
+                0x08000130                WWDG_IRQHandler
+                0x08000130                TIM1_BRK_IRQHandler
+                0x08000130                EXTI1_IRQHandler
+                0x08000130                USART2_IRQHandler
+                0x08000130                I2C2_ER_IRQHandler
+                0x08000130                DMA1_Channel2_IRQHandler
+                0x08000130                CAN1_SCE_IRQHandler
+                0x08000130                FLASH_IRQHandler
+                0x08000130                BusFault_Handler
+                0x08000130                USART1_IRQHandler
+                0x08000130                I2C1_ER_IRQHandler
+                0x08000130                USBWakeUp_IRQHandler
+ *fill*         0x08000132        0x2 
+ .text.Reset_Handler
+                0x08000134       0x40 build/startup_f103.o
+                0x08000134                Reset_Handler
+ .text.baremetal_init
+                0x08000174       0xd0 build/stm32_baremetal.o
+                0x08000174                baremetal_init
+ .text.UART1_SendString
+                0x08000244       0x38 build/stm32_baremetal.o
+                0x08000244                UART1_SendString
+ .text.delay_us
+                0x0800027c       0x14 build/stm32_baremetal.o
+                0x0800027c                delay_us
+ .text.delay_ms
+                0x08000290       0x14 build/stm32_baremetal.o
+                0x08000290                delay_ms
+ .text.SysTick_Handler
+                0x080002a4       0x10 build/stm32_baremetal.o
+                0x080002a4                SysTick_Handler
+ .text.TIM2_IRQHandler
+                0x080002b4       0x24 build/stm32_baremetal.o
+                0x080002b4                TIM2_IRQHandler
+ .text.EXTI0_IRQHandler
+                0x080002d8       0x38 build/stm32_baremetal.o
+                0x080002d8                EXTI0_IRQHandler
+ .text.startup.main
+                0x08000310      0x200 build/node_a_tx.o
+                0x08000310                main
+ *(.rodata)
+ *(.rodata*)
+ .rodata.Log_Msg.str1.1
+                0x08000510       0x53 build/log.o
+                                  0xc (size before relaxing)
+ .rodata.main.str1.1
+                0x08000563        0x0 build/node_a_tx.o
+                                 0x47 (size before relaxing)
+ *(.glue_7)
+ .glue_7        0x08000563        0x0 linker stubs
+ *(.glue_7t)
+ .glue_7t       0x08000563        0x0 linker stubs
+ *(.eh_frame)
+                0x08000564                        . = ALIGN (0x4)
+ *fill*         0x08000563        0x1 
+                0x08000564                        _etext = .
+                0x08000564                        _sidata = LOADADDR (.data)
+
+.vfp11_veneer   0x08000564        0x0
+ .vfp11_veneer  0x08000564        0x0 linker stubs
+
+.v4_bx          0x08000564        0x0
+ .v4_bx         0x08000564        0x0 linker stubs
+
+.iplt           0x08000564        0x0
+ .iplt          0x08000564        0x0 build/log.o
+
+.rel.dyn        0x08000564        0x0
+ .rel.iplt      0x08000564        0x0 build/log.o
+
+.data           0x20000000        0x0 load address 0x08000564
+                0x20000000                        . = ALIGN (0x4)
+                0x20000000                        _sdata = .
+ *(.data)
+ *(.data*)
+                0x20000000                        . = ALIGN (0x4)
+                0x20000000                        _edata = .
+
+.igot.plt       0x20000000        0x0 load address 0x08000564
+ .igot.plt      0x20000000        0x0 build/log.o
+
+.bss            0x20000000       0x14 load address 0x08000564
+                0x20000000                        . = ALIGN (0x4)
+                0x20000000                        _sbss = .
+ *(.bss)
+ *(.bss*)
+ .bss.g_exti0_timestamp
+                0x20000000        0x4 build/stm32_baremetal.o
+ .bss.g_exti0_flag
+                0x20000004        0x1 build/stm32_baremetal.o
+ *fill*         0x20000005        0x3 
+ .bss.g_tim2_hop_cb
+                0x20000008        0x4 build/stm32_baremetal.o
+ .bss.g_exti0_cb
+                0x2000000c        0x4 build/stm32_baremetal.o
+ .bss.g_ms_ticks
+                0x20000010        0x4 build/stm32_baremetal.o
+ *(COMMON)
+                0x20000014                        . = ALIGN (0x4)
+                0x20000014                        _ebss = .
+
+/DISCARD/
+ *(.comment)
+ *(.ARM.attributes)
+OUTPUT(build/firmware.elf elf32-littlearm)
+LOAD linker stubs
