@@ -14,8 +14,9 @@
 #include "step5_fault_test.h"
 #include "step6_data_mock.h"
 #include "step7_arq_mock.h"
+#include "custom_rx.h"
 
-#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK) && !defined(STEP3_FHSS_MOCK) && !defined(STEP4_RADIO_SPI_DIAG) && !defined(STEP5_FAULT_TEST) && !defined(STEP6_DATA_MOCK) && !defined(STEP7_ARQ_MOCK)
+#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK) && !defined(STEP3_FHSS_MOCK) && !defined(STEP4_RADIO_SPI_DIAG) && !defined(STEP5_FAULT_TEST) && !defined(STEP6_DATA_MOCK) && !defined(STEP7_ARQ_MOCK) && !defined(CUSTOM_RX_MODE)
 /* Global test variables for checking .data and .bss initialization */
 static volatile uint32_t g_test_data = 0x12345678;
 static volatile uint32_t g_test_bss = 0;
@@ -56,7 +57,7 @@ static void run_selftests(void) {
 }
 #endif
 
-#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK) && !defined(STEP3_FHSS_MOCK) && !defined(STEP4_RADIO_SPI_DIAG) && !defined(STEP5_FAULT_TEST) && !defined(STEP6_DATA_MOCK) && !defined(STEP7_ARQ_MOCK)
+#if !defined(SELFTEST_SPI_LOOPBACK) && !defined(SELFTEST_PINS) && !defined(SELFTEST_TX_BLIND) && !defined(SELFTEST_MISO_STATIC) && !defined(DEMO_USART_LINK) && !defined(STEP1_UART_TEST) && !defined(STEP2_MOCK) && !defined(STEP3_FHSS_MOCK) && !defined(STEP4_RADIO_SPI_DIAG) && !defined(STEP5_FAULT_TEST) && !defined(STEP6_DATA_MOCK) && !defined(STEP7_ARQ_MOCK) && !defined(CUSTOM_RX_MODE)
 static void log_reg_mismatch(uint8_t ver) {
     if (ver == 0x00) {
         Log_Msg("RADIO", "RegVersion=0x00 mismatch (MISO stuck low)");
@@ -662,7 +663,9 @@ static void run_selftest_miso_static(void) {
 int main(void) {
     baremetal_init();
 
-#if defined(STEP7_ARQ_MOCK)
+#if defined(CUSTOM_RX_MODE)
+    custom_rx_run();
+#elif defined(STEP7_ARQ_MOCK)
     step7_arq_mock_run();
 #elif defined(STEP6_DATA_MOCK)
     step6_data_mock_run();

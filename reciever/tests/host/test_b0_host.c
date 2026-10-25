@@ -1577,6 +1577,253 @@ static void test_step7_arq_mock(void) {
     printf("[HOST_TEST] test_step7_arq_mock: PASS\n");
 }
 
+#include "custom_rx.h"
+
+static void test_custom_rx(void) {
+    custom_rx_harness_t h;
+    fhss_packet_t ack;
+    uint8_t tx_ch = 0;
+    fhss_packet_t rx_pkt;
+    uint8_t env[48];
+    uint16_t env_len = 0;
+    custom_rx_outcome_t outcome;
+    uint16_t avail = 0;
+
+    /* 1. Single-fragment message reception */
+    custom_rx_harness_init(&h);
+    mock_rx_reset();
+    make_test_data_envelope(0, 0, 1, 1, 0, 1, (const uint8_t *)"Hello Node B!", 13, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_MSG_COMPLETE);
+    assert(h.completed_messages == 1);
+    assert(h.has_completed_msg == 1);
+    assert(h.last_completed.total_len == 13);
+    assert(strcmp((char *)h.last_completed.data, "Hello Node B!") == 0);
+    assert(ack.ver_type == (uint8_t)(PKT_VER_PREFIX | PKT_TYPE_ACK));
+    assert(ack.seq == 0);
+    assert(ack.msg_id == 1);
+    assert(ack.payload[0] == 0x01);
+    assert(h.b_seq == 1);
+    assert(h.tx_ack_count == 1);
+
+    /* 2. Multi-fragment message reconstruction (3 fragments) */
+    /* Frag 0: seq=1, msg_id=2, total=3, idx=0, last=0 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 1, 2, 3, 0, 0, (const uint8_t *)"FirstFragment16B", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_FRAG);
+    assert(ack.seq == 1);
+    assert(ack.msg_id == 2);
+    assert(ack.payload[0] == 0x01);
+    assert(h.b_seq == 2);
+
+    /* Frag 1: seq=2, msg_id=2, total=3, idx=1, last=0 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 2, 3, 1, 0, (const uint8_t *)"SecondFragmt16B!", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_FRAG);
+    assert(ack.seq == 2);
+    assert(ack.msg_id == 2);
+    assert(ack.payload[0] == 0x03);
+    assert(h.b_seq == 3);
+
+    /* Frag 2: seq=3, msg_id=2, total=3, idx=2, last=1 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 2, 3, 2, 1, (const uint8_t *)"Done!", 5, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_MSG_COMPLETE);
+    assert(h.completed_messages == 2);
+    assert(h.last_completed.total_len == 37);
+    assert(strcmp((char *)h.last_completed.data, "FirstFragment16BSecondFragmt16B!Done!") == 0);
+    assert(ack.seq == 3);
+    assert(ack.msg_id == 2);
+    assert(ack.payload[0] == 0x07);
+    assert(h.b_seq == 4);
+
+    /* 3. Maximum supported message length (exact 128 bytes, 8 fragments) */
+    uint8_t exp_128[129];
+    for (int i = 0; i < 128; i++) {
+        exp_128[i] = (uint8_t)('A' + (i % 26));
+    }
+    exp_128[128] = '\0';
+
+    for (uint8_t f = 0; f < 8; f++) {
+        mock_rx_reset();
+        uint8_t is_last_f = (f == 7) ? 1 : 0;
+        make_test_data_envelope(0, (uint8_t)(4 + f), 3, 8, f, is_last_f, &exp_128[f * 16], 16, 0, 0, env, &env_len);
+        mock_rx_push(env, env_len);
+        avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+        outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+        if (f < 7) {
+            assert(outcome == CUSTOM_RX_PASS_FRAG);
+            assert(ack.payload[0] == (uint8_t)((1 << (f + 1)) - 1));
+        } else {
+            assert(outcome == CUSTOM_RX_PASS_MSG_COMPLETE);
+            assert(ack.payload[0] == 0xFF);
+        }
+    }
+    assert(h.completed_messages == 3);
+    assert(h.last_completed.total_len == 128);
+    assert(memcmp(h.last_completed.data, exp_128, 128) == 0);
+
+    /* 4. Identical duplicate fragment handling (during active reassembly) */
+    /* Start Msg 4, frag 0 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 15, 4, 2, 0, 0, (const uint8_t *)"0123456789ABCDEF", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_FRAG);
+    assert(h.reasm.rx_bitmap == 0x01);
+    uint32_t acks_before = h.tx_ack_count;
+
+    /* Duplicate of frag 0 with fresh sequence 16 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 16, 4, 2, 0, 0, (const uint8_t *)"0123456789ABCDEF", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_DUPLICATE_FRAG);
+    assert(h.rx_dup_frag_count == 1);
+    assert(h.reasm.rx_bitmap == 0x01); /* bitmap unchanged */
+    assert(h.tx_ack_count == acks_before + 1);
+    assert(ack.payload[0] == 0x01); /* cumulative ACK returned */
+
+    /* 5. Conflicting duplicate rejection */
+    /* Repeated Frag 0 with fresh sequence 17, but conflicting payload */
+    mock_rx_reset();
+    make_test_data_envelope(0, 17, 4, 2, 0, 0, (const uint8_t *)"CONFLICT_PAYLOAD", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_CONFLICT);
+    assert(h.proto_conflict_count == 1);
+    /* Stored data must NOT be corrupted */
+    assert(memcmp(&h.reasm.data[0], "0123456789ABCDEF", 16) == 0);
+
+    /* Complete Msg 4 with valid frag 1 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 18, 4, 2, 1, 1, (const uint8_t *)"FINAL_PART_TEST!", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_MSG_COMPLETE);
+    assert(h.completed_messages == 4);
+    assert(strcmp((char *)h.last_completed.data, "0123456789ABCDEFFINAL_PART_TEST!") == 0);
+
+    /* 6. Duplicate of already completed message */
+    /* Node A lost final ACK of Msg 4, retransmits frag 1 with fresh seq 19 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 19, 4, 2, 1, 1, (const uint8_t *)"FINAL_PART_TEST!", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_DUPLICATE_FRAG);
+    assert(ack.payload[0] == 0x03); /* full completed bitmap */
+    assert(h.completed_messages == 4); /* count not incremented */
+
+    /* 7. Replay rejection */
+    /* Same sequence 19 replayed */
+    mock_rx_reset();
+    make_test_data_envelope(0, 19, 5, 1, 0, 1, (const uint8_t *)"REPLAY", 6, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_REPLAY);
+    assert(h.proto_replay_count == 1);
+
+    /* Older sequence 10 */
+    mock_rx_reset();
+    make_test_data_envelope(0, 10, 5, 1, 0, 1, (const uint8_t *)"OLD_SEQ", 7, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_REPLAY);
+    assert(h.proto_replay_count == 2);
+
+    /* 8. Sequence wraparound (e.g. from seq 255 to 0) */
+    h.last_seq = 255;
+    mock_rx_reset();
+    make_test_data_envelope(0, 0, 6, 1, 0, 1, (const uint8_t *)"WRAP", 4, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_MSG_COMPLETE);
+    assert(h.last_seq == 0);
+
+    /* 9. Wrong-channel rejection */
+    mock_rx_reset();
+    make_test_data_envelope(2 /* wrong channel */, 1, 7, 1, 0, 1, (const uint8_t *)"WRONG_CH", 8, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_WRONG_CH);
+    assert(h.proto_wrong_ch_count == 1);
+
+    /* 10. Corrupted envelope rejection */
+    /* Bad outer CRC */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 7, 1, 0, 1, (const uint8_t *)"BAD_CRC", 7, 1, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_ERR_ENV_CRC);
+
+    /* Bad tag CRC */
+    mock_rx_reset();
+    make_test_data_envelope(0, 2, 7, 1, 0, 1, (const uint8_t *)"BAD_TAG", 7, 0, 1, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_BAD_TAG);
+
+    /* 11. Metadata violations:
+     * - idx >= total
+     * - non-final fragment len < 16
+     * - total changed mid-message
+     */
+    /* idx >= total (idx=2, total=2) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 3, 8, 2, 2, 1, (const uint8_t *)"BAD_IDX", 7, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_METADATA);
+
+    /* Non-final fragment with len < 16 (e.g. 10B on frag 0/2) */
+    mock_rx_reset();
+    make_test_data_envelope(0, 4, 8, 2, 0, 0, (const uint8_t *)"SHORT_PART", 10, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_METADATA);
+
+    /* Total changed mid-message */
+    mock_rx_reset();
+    make_test_data_envelope(0, 5, 8, 2, 0, 0, (const uint8_t *)"VALID_PART_ONE__", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_PASS_FRAG);
+
+    mock_rx_reset();
+    make_test_data_envelope(0, 6, 8, 3 /* changed to 3! */, 1, 0, (const uint8_t *)"VALID_PART_TWO__", 16, 0, 0, env, &env_len);
+    mock_rx_push(env, env_len);
+    avail = (uint16_t)((s_mock_rx_head - s_mock_rx_tail) & 255);
+    outcome = custom_rx_process_incoming(&h, avail, mock_rx_peek, mock_rx_advance, &ack, &tx_ch, &rx_pkt);
+    assert(outcome == CUSTOM_RX_REJECT_METADATA);
+
+    printf("[HOST_TEST] test_custom_rx: PASS\n");
+}
+
 int main(void) {
     printf("--- Running Node B Host Tests (Step B0, B2, Step 1, Stage 2, Stage 3, Stage 4, Stage 5, Stage 6 & Stage 7) ---\n");
     test_status_strings();
@@ -1591,6 +1838,7 @@ int main(void) {
     test_step5_fault_test();
     test_step6_data_mock();
     test_step7_arq_mock();
+    test_custom_rx();
     printf("--- All Host Tests Passed ---\n");
     return 0;
 }

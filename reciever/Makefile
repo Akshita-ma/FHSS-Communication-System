@@ -40,6 +40,7 @@ OBJS        = $(BUILD_DIR)/status.o \
               $(BUILD_DIR)/step5_fault_test.o \
               $(BUILD_DIR)/step6_data_mock.o \
               $(BUILD_DIR)/step7_arq_mock.o \
+              $(BUILD_DIR)/custom_rx.o \
               $(BUILD_DIR)/node_b_rx.o
 
 # Host test sources
@@ -55,12 +56,13 @@ HOST_SRCS   = ../common/status.c \
               node_b_f4/step5_fault_test.c \
               node_b_f4/step6_data_mock.c \
               node_b_f4/step7_arq_mock.c \
+              node_b_f4/custom_rx.c \
               tests/host/mock_hal.c \
               tests/host/test_b0_host.c
 
 HOST_CFLAGS = -Wall -Wextra -Werror -I../common -Itests/host -Inode_b_f4 -DHOST_TEST
 
-.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock step3_fhss_mock step3-fhss-mock flash_step3 flash_step3_mock step4_radio_spi_diag step4-radio-spi-diag flash_step4 flash_step4_radio_spi_diag step5_fault_test step5-fault-test flash_step5 flash_step5_fault_test step6_data_mock step6-data-mock flash_step6 flash_step6_data_mock step7_arq_mock step7-arq-mock flash_step7 flash_step7_arq_mock
+.PHONY: all clean flash test selftest_b0 selftest_b1 selftest_b2 selftest_spi_loopback selftest_pins selftest_tx_blind selftest_miso_static demo debug step1-uart-test flash_step1 step2_mock step2-mock flash_step2 flash_step2_mock step3_fhss_mock step3-fhss-mock flash_step3 flash_step3_mock step4_radio_spi_diag step4-radio-spi-diag flash_step4 flash_step4_radio_spi_diag step5_fault_test step5-fault-test flash_step5 flash_step5_fault_test step6_data_mock step6-data-mock flash_step6 flash_step6_data_mock step7_arq_mock step7-arq-mock flash_step7 flash_step7_arq_mock custom_rx custom-rx interactive_rx interactive-rx flash_custom_rx flash_custom flash_interactive_rx
 
 step1-uart-test: CFLAGS += -DSTEP1_UART_TEST
 step1-uart-test: clean
@@ -169,6 +171,25 @@ flash_step7: step7_arq_mock
 	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/step7_arq_mock.elf verify reset exit"
 
 flash_step7_arq_mock: flash_step7
+
+custom_rx: CFLAGS += -DCUSTOM_RX_MODE
+custom_rx: clean
+	@$(MAKE) $(BUILD_DIR)/custom_rx.elf $(BUILD_DIR)/custom_rx.bin $(BUILD_DIR)/custom_rx.hex TARGET=custom_rx CFLAGS="$(CFLAGS) -DCUSTOM_RX_MODE"
+	@cp -f $(BUILD_DIR)/custom_rx.elf $(BUILD_DIR)/$(ALT_TARGET).elf 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/custom_rx.bin $(BUILD_DIR)/$(ALT_TARGET).bin 2>/dev/null || true
+	@cp -f $(BUILD_DIR)/custom_rx.hex $(BUILD_DIR)/$(ALT_TARGET).hex 2>/dev/null || true
+	@echo "--- Custom RX Build complete ---"
+	$(SIZE) $(BUILD_DIR)/custom_rx.elf
+
+custom-rx: custom_rx
+interactive_rx: custom_rx
+interactive-rx: custom_rx
+
+flash_custom_rx: custom_rx
+	openocd $(OPENOCD_CFG) -c "program $(BUILD_DIR)/custom_rx.elf verify reset exit"
+
+flash_custom: flash_custom_rx
+flash_interactive_rx: flash_custom_rx
 
 demo: CFLAGS += -DDEMO_USART_LINK -DDEMO_TRACE
 ifeq ($(RF_KEYING),1)
